@@ -46,6 +46,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -65,13 +66,22 @@ from tkinter import filedialog, messagebox
 # Logging
 # =============================================================================
 
-LOG_FILENAME = "png_to_ico.log"
+from datetime import datetime
+
+# Log files go to: <script_root>/_logs/png_to_ico_YYYY-MM-DD_HH-MM-SS.log
+SCRIPT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_ROOT_DIR, "_logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+LOG_FILENAME = f"png_to_ico_{LOG_TS}.log"
+LOG_PATH = os.path.join(LOG_DIR, LOG_FILENAME)
 
 logging.basicConfig(
   level=logging.INFO,
   format="%(asctime)s [%(levelname)s] %(message)s",
   handlers=[
-    logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
+    logging.FileHandler(LOG_PATH, encoding="utf-8"),
     logging.StreamHandler(sys.stdout),
   ],
 )
