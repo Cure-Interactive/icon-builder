@@ -83,7 +83,7 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # Constants / Regex
 # =============================================================================
 
-APP_TITLE = "PNG to ICO (Manual Layers + Target Sizes)"
+APP_TITLE = "PNG to ICO"
 CONFIG_FILENAME = "config.json"
 
 # Match "000x000" style tokens anywhere in filename (1-4 digits each).
