@@ -83,7 +83,7 @@ SIZE_TOKEN_RE = re.compile(r"(?P<w>\d{1,4})x(?P<h>\d{1,4})", re.IGNORECASE)
 
 
 # =============================================================================
-# Window
+# Window Icon (title bar / taskbar best-effort)
 # =============================================================================
 
 def set_window_icon(root, ico_path: str, png_path: str) -> None:
