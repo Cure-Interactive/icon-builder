@@ -5,27 +5,35 @@
 png_to_ico_gui.py
 
 Purpose
-- Native GUI (CustomTkinter) for building a multi-layer Windows .ICO from PNG layers
-  discovered strictly via filename size tokens like "000x000" (e.g., 128x128, 32x32).
-- No default sizes. All layers come from:
-  1) Automatic discovery in the selected input directory (regex size token), and/or
-  2) Manual user configuration in the UI (selecting specific layer files).
-- Layers are always ordered largest → smallest (by pixel area, then width/height).
+- Native GUI (CustomTkinter) for building a multi-layer Windows .ICO from PNG layers.
+- Layers can come from:
+  1) Automatic discovery in the selected input directory (regex WxH size token), and/or
+  2) Manual user configuration in the UI:
+     - choose any PNG file for a layer
+     - set/override that layer's target size (W,H)
+
+Layer rules
+- Layers are always ordered largest → smallest (by target pixel area, then width/height).
+- At build time, each enabled layer is resized to its configured target size (if needed).
 
 Config behavior
 - A `config.json` is stored INSIDE the selected input directory.
 - When an input directory is selected:
   - If `config.json` exists, it is loaded and used to populate UI + selections.
   - If missing, the UI is populated from discovered layers and written to `config.json`.
-- The program keeps `config.json` updated whenever the layer list or output settings change.
+- The program keeps `config.json` updated whenever:
+  - layer list changes
+  - enabled state changes
+  - file path changes
+  - target size changes
+  - output settings change
 
 Dependencies
 - pip install pillow icoutil customtkinter
 
 Notes
-- Layer filename MUST contain a "{W}x{H}" token somewhere in the basename.
-  Example: "layer_128x128.png" or "icon-16x16.png"
-- Manual layer add still requires the size token in the filename (per requirement).
+- Auto-discovery still uses filenames containing a "{W}x{H}" token, e.g., "icon_32x32.png".
+- Manual per-layer file selection does NOT require a size token; target size is editable in UI.
 - Paths in config are stored as relative to input directory when possible.
 """
 
@@ -36,6 +44,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -74,11 +83,10 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # Constants / Regex
 # =============================================================================
 
-APP_TITLE = "PNG to ICO (Layers via WxH filenames)"
+APP_TITLE = "PNG to ICO (Manual Layers + Target Sizes)"
 CONFIG_FILENAME = "config.json"
 
 # Match "000x000" style tokens anywhere in filename (1-4 digits each).
-# Examples: "layer_128x128.png", "icon.16x16@2x.png", "foo_256x256_bar.png"
 SIZE_TOKEN_RE = re.compile(r"(?P<w>\d{1,4})x(?P<h>\d{1,4})", re.IGNORECASE)
 
 
@@ -102,19 +110,16 @@ def set_window_icon(root, ico_path: str, png_path: str) -> None:
   ico_abs = os.path.abspath(ico_path) if ico_path else ""
   png_abs = os.path.abspath(png_path) if png_path else ""
 
-  # Windows: .ico
   try:
     if ico_abs and os.path.isfile(ico_abs):
       root.iconbitmap(ico_abs)
   except Exception:
     pass
 
-  # Cross-platform: .png (Linux/macOS, sometimes Windows too)
   try:
     if png_abs and os.path.isfile(png_abs):
       img = tk.PhotoImage(file=png_abs)
       root.iconphoto(True, img)
-      # Keep a reference so it doesn't get GC'd.
       root._iconphoto_ref = img  # type: ignore[attr-defined]
   except Exception:
     pass
@@ -130,12 +135,12 @@ class LayerItem:
   Represents one layer entry in the UI/config.
 
   Attributes
-  - size: (width, height) parsed from filename token.
-  - rel_path: file path relative to input_dir when possible.
+  - target_size: (width, height) configured in UI/config for ICO layer.
+  - source_rel_path: file path relative to input_dir when possible (else absolute).
   - enabled: whether to include this layer in ICO build.
   """
-  size: Tuple[int, int]
-  rel_path: str
+  target_size: Tuple[int, int]
+  source_rel_path: str
   enabled: bool = True
 
   def size_key_desc(self) -> Tuple[int, int, int]:
@@ -145,7 +150,7 @@ class LayerItem:
       - width desc
       - height desc
     """
-    w, h = self.size
+    w, h = self.target_size
     return (w * h, w, h)
 
 
@@ -193,7 +198,6 @@ def normalize_relpath(input_dir: str, path: str) -> str:
 
   try:
     rel = os.path.relpath(path_abs, input_dir_abs)
-    # If relpath goes outside (..), store absolute to be explicit.
     if rel.startswith(".."):
       return path_abs
     return rel
@@ -245,8 +249,7 @@ def load_config(input_dir: str) -> Optional[dict]:
 def save_config(input_dir: str, data: dict) -> None:
   """
   Save config.json in the input directory.
-
-  This is intended to be called often to "keep config updated".
+  Intended to be called often to "keep config updated".
   """
   p = config_path_for_input_dir(input_dir)
   try:
@@ -262,10 +265,13 @@ def layers_to_config(layers: List[LayerItem]) -> List[dict]:
   """
   out: List[dict] = []
   for it in layers:
-    w, h = it.size
+    w, h = it.target_size
     out.append({
+      # New (explicit)
+      "target_size": f"{w}x{h}",
+      # Back-compat for older config readers
       "size": f"{w}x{h}",
-      "path": it.rel_path,
+      "path": it.source_rel_path,
       "enabled": bool(it.enabled),
     })
   return out
@@ -274,6 +280,10 @@ def layers_to_config(layers: List[LayerItem]) -> List[dict]:
 def layers_from_config(data: dict) -> List[LayerItem]:
   """
   Deserialize layer items from config.json structure.
+
+  Accepts:
+  - "target_size" (preferred) or "size" (legacy)
+  - "path" for source image
   """
   raw = data.get("layers", [])
   out: List[LayerItem] = []
@@ -284,7 +294,8 @@ def layers_from_config(data: dict) -> List[LayerItem]:
   for entry in raw:
     if not isinstance(entry, dict):
       continue
-    size_s = entry.get("size", "")
+
+    size_s = entry.get("target_size", entry.get("size", ""))
     p = entry.get("path", "")
     en = bool(entry.get("enabled", True))
 
@@ -293,12 +304,9 @@ def layers_from_config(data: dict) -> List[LayerItem]:
 
     size = parse_size_token(size_s)
     if not size:
-      # As a safety fallback, try to parse from the filename itself.
-      size = parse_size_token(os.path.basename(p))
-    if not size:
       continue
 
-    out.append(LayerItem(size=size, rel_path=p, enabled=en))
+    out.append(LayerItem(target_size=size, source_rel_path=p, enabled=en))
 
   return out
 
@@ -316,7 +324,7 @@ def discover_layers_in_dir(input_dir: str) -> Dict[Tuple[int, int], str]:
 
   Tie-breaker
   - If multiple files produce same size: keep the first encountered (stable enough).
-    Users can override via the manual layer editor UI.
+    Users can override by editing file/target size in UI.
   """
   found: Dict[Tuple[int, int], str] = {}
 
@@ -348,9 +356,8 @@ def merge_config_layers_with_discovery(
 
   Behavior
   - Preserve config ordering/enablement for sizes it already knows.
-  - For newly discovered sizes not in config, add them enabled=True.
-  - For config sizes whose files are missing, keep them (so user can fix),
-    but they will be marked missing in UI and skipped at build-time if missing.
+  - For newly discovered sizes not in config, add them enabled=True, target_size=size.
+  - For config entries whose files are missing, keep them (so user can fix).
 
   Returns
   - merged list (not yet sorted).
@@ -358,34 +365,48 @@ def merge_config_layers_with_discovery(
   out: List[LayerItem] = []
   seen_sizes: set = set()
 
-  # Keep config items first.
   for it in cfg_layers:
     out.append(it)
-    seen_sizes.add(it.size)
+    seen_sizes.add(it.target_size)
 
-  # Append any discovered not in config.
   for size, relp in discovered.items():
     if size in seen_sizes:
       continue
-    out.append(LayerItem(size=size, rel_path=relp, enabled=True))
+    out.append(LayerItem(target_size=size, source_rel_path=relp, enabled=True))
     seen_sizes.add(size)
 
-  # Normalize paths to prefer relative
   for it in out:
-    it.rel_path = normalize_relpath(input_dir, resolve_path(input_dir, it.rel_path))
+    it.source_rel_path = normalize_relpath(input_dir, resolve_path(input_dir, it.source_rel_path))
 
   return out
 
 
 def sort_layers_desc(layers: List[LayerItem]) -> List[LayerItem]:
   """
-  Always order largest → smallest.
+  Always order largest → smallest (by target size).
   """
   return sorted(layers, key=lambda it: it.size_key_desc(), reverse=True)
 
 
+def infer_png_size(path: str) -> Optional[Tuple[int, int]]:
+  """
+  Read PNG dimensions from disk.
+
+  Returns
+  - (W,H) or None if unreadable.
+  """
+  try:
+    with Image.open(path) as img:
+      w, h = img.size
+      if w > 0 and h > 0:
+        return (int(w), int(h))
+  except Exception:
+    return None
+  return None
+
+
 # =============================================================================
-# ICO build
+# ICO build (with per-layer resizing)
 # =============================================================================
 
 def build_ico_from_layers(
@@ -397,11 +418,10 @@ def build_ico_from_layers(
   """
   Build an .ICO from enabled layers in the list.
 
-  Requirements enforced
-  - Layers added in largest → smallest order.
-  - Only enabled layers with existing files are included.
-  - No resizing is done here; you are expected to provide correctly-sized PNGs.
-    (If you want resizing back, say so and I’ll add an explicit toggle.)
+  Behavior
+  - Layers are added in largest → smallest order (by target size).
+  - Only enabled layers with existing source files are included.
+  - Each layer image is resized to its target size (if needed) before adding to the ICO.
 
   Returns
   - absolute path to the created ICO
@@ -411,40 +431,60 @@ def build_ico_from_layers(
 
   out_dir_abs = os.path.abspath(output_dir)
   os.makedirs(out_dir_abs, exist_ok=True)
-
   ico_path = os.path.abspath(os.path.join(out_dir_abs, output_name))
 
   enabled = [it for it in sort_layers_desc(layers) if it.enabled]
 
-  # Validate: must have at least one existing layer.
   usable: List[Tuple[LayerItem, str]] = []
   for it in enabled:
-    full = resolve_path(input_dir, it.rel_path)
+    full = resolve_path(input_dir, it.source_rel_path)
     if os.path.isfile(full):
       usable.append((it, full))
 
   if not usable:
-    raise ValueError("No enabled layer PNGs exist on disk. Fix paths or rescan layers.")
+    raise ValueError("No enabled layer PNGs exist on disk. Fix paths or add layers.")
 
-  # If duplicates sizes exist enabled, keep first (largest-first order still).
+  # If duplicate target sizes exist enabled, keep first (largest-first order still).
   seen_sizes: set = set()
   unique: List[Tuple[LayerItem, str]] = []
   for it, full in usable:
-    if it.size in seen_sizes:
+    if it.target_size in seen_sizes:
       continue
     unique.append((it, full))
-    seen_sizes.add(it.size)
+    seen_sizes.add(it.target_size)
 
   ico = icoutil.IcoFile()
 
-  # Add in descending order.
-  for it, full in unique:
-    ico.add_png(full)
-    w, h = it.size
-    logging.info("Add layer %dx%d: %s", w, h, full)
+  # Temp files for resized PNGs, so icoutil can ingest them by path.
+  temp_paths: List[str] = []
+  try:
+    for it, full in unique:
+      tw, th = it.target_size
+      if tw <= 0 or th <= 0:
+        raise ValueError(f"Invalid target size for layer: {tw}x{th}")
 
-  ico.write(ico_path)
-  logging.info("ICO written: %s", ico_path)
+      with Image.open(full) as img:
+        img = img.convert("RGBA")
+        if img.size != (tw, th):
+          img = img.resize((tw, th), resample=Image.LANCZOS)
+
+        fd, tmp_path = tempfile.mkstemp(prefix="png_to_ico_layer_", suffix=".png")
+        os.close(fd)
+
+        img.save(tmp_path, format="PNG", optimize=True)
+        temp_paths.append(tmp_path)
+
+      ico.add_png(tmp_path)
+      logging.info("Add layer %dx%d from %s", tw, th, full)
+
+    ico.write(ico_path)
+    logging.info("ICO written: %s", ico_path)
+  finally:
+    for p in temp_paths:
+      try:
+        os.remove(p)
+      except Exception:
+        pass
 
   return ico_path
 
@@ -458,13 +498,13 @@ class App(ctk.CTk):
   CustomTkinter application for managing layers and building ICO files.
 
   UI features
-  - Select input directory (contains layers + config.json).
-  - Rescan layers from filenames containing WxH.
-  - Manual layer controls:
-    - Enable/disable per layer
-    - Replace file per layer
+  - Select input directory (contains config.json, may contain discovered layers).
+  - Rescan layers (auto-discovery from filenames containing WxH).
+  - Per-layer controls:
+    - Enable/disable
+    - Choose source PNG file (any)
+    - Set target size (W,H)
     - Remove layer
-    - Add new layer from file
   - Output settings:
     - output directory
     - output file name
@@ -480,22 +520,16 @@ class App(ctk.CTk):
     ctk.set_default_color_theme("blue")
 
     self.title(APP_TITLE)
-    self.geometry("980x640")
+    self.geometry("1040x680")
 
     self.input_dir: str = ""
     self.layers: List[LayerItem] = []
 
-    # Settings
     self.output_dir_var = tk.StringVar(value=os.path.abspath(os.getcwd()))
     self.output_name_var = tk.StringVar(value="icon.ico")
 
-    # Top: Input directory controls
     self._build_top_controls()
-
-    # Middle: Layers editor
     self._build_layers_editor()
-
-    # Bottom: Actions + log
     self._build_bottom_controls()
 
   # ---------------------------------------------------------------------------
@@ -515,7 +549,7 @@ class App(ctk.CTk):
     self.btn_browse_input = ctk.CTkButton(self.top, text="Browse…", command=self.on_browse_input_dir, width=110)
     self.btn_browse_input.grid(row=0, column=2, padx=8, pady=8)
 
-    self.btn_load = ctk.CTkButton(self.top, text="Load/Refresh", command=self.on_load_input_dir, width=110)
+    self.btn_load = ctk.CTkButton(self.top, text="Load/Refresh", command=self.on_load_input_dir, width=120)
     self.btn_load.grid(row=0, column=3, padx=8, pady=8)
 
     self.btn_rescan = ctk.CTkButton(self.top, text="Rescan Layers", command=self.on_rescan_layers, width=130)
@@ -530,12 +564,14 @@ class App(ctk.CTk):
     header = ctk.CTkFrame(self.mid)
     header.pack(fill="x", padx=8, pady=(8, 6))
 
-    ctk.CTkLabel(header, text="Layers (largest → smallest) — filenames must contain WxH token").pack(side="left", padx=8)
+    ctk.CTkLabel(
+      header,
+      text="Layers (largest → smallest) — each layer has a source PNG + a target size (W,H)",
+    ).pack(side="left", padx=8)
 
     self.btn_add_layer = ctk.CTkButton(header, text="Add Layer…", command=self.on_add_layer, width=120)
     self.btn_add_layer.pack(side="right", padx=8)
 
-    # Scrollable list
     self.layer_scroll = ctk.CTkScrollableFrame(self.mid)
     self.layer_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
@@ -559,7 +595,6 @@ class App(ctk.CTk):
 
     self.bottom.grid_columnconfigure(1, weight=1)
 
-    # Save config whenever output fields change
     self.output_dir_var.trace_add("write", lambda *_: self.persist_config_if_possible())
     self.output_name_var.trace_add("write", lambda *_: self.persist_config_if_possible())
 
@@ -569,7 +604,7 @@ class App(ctk.CTk):
 
   def make_config_dict(self) -> dict:
     return {
-      "version": 1,
+      "version": 2,
       "input_dir": ".",  # implicit; config lives inside input_dir
       "output_dir": self.output_dir_var.get(),
       "output_name": self.output_name_var.get(),
@@ -577,37 +612,23 @@ class App(ctk.CTk):
     }
 
   def persist_config_if_possible(self) -> None:
-    """
-    Save config.json into the current input directory, if one is selected.
-    """
     if not self.input_dir or not os.path.isdir(self.input_dir):
       return
     save_config(self.input_dir, self.make_config_dict())
 
   def load_or_init_from_input_dir(self, input_dir: str) -> None:
-    """
-    When selecting an input dir:
-    - Load config.json if present
-    - Else discover layers and create config
-
-    Output dir default rule:
-    - If config has no output_dir (or blank), default output_dir to input_dir.
-    - If no config exists, output_dir defaults to input_dir.
-    """
     self.input_dir = os.path.abspath(input_dir)
     self.input_dir_var.set(self.input_dir)
 
     cfg = load_config(self.input_dir)
     discovered = discover_layers_in_dir(self.input_dir)
 
-    # Default output dir to the selected input directory unless config explicitly provides one.
     default_out_dir = self.input_dir
 
     if cfg:
       cfg_layers = layers_from_config(cfg)
       merged = merge_config_layers_with_discovery(self.input_dir, cfg_layers, discovered)
 
-      # Restore output settings if present; otherwise default to input dir
       out_dir = cfg.get("output_dir")
       out_name = cfg.get("output_name")
 
@@ -618,21 +639,15 @@ class App(ctk.CTk):
 
       if isinstance(out_name, str) and out_name.strip():
         self.output_name_var.set(out_name)
-      # else: keep whatever is already in the UI (typically "icon.ico")
 
       self.layers = sort_layers_desc(merged)
-
     else:
-      # No config -> initialize from discovered layers
       init_layers: List[LayerItem] = []
       for size, relp in discovered.items():
-        init_layers.append(LayerItem(size=size, rel_path=relp, enabled=True))
+        init_layers.append(LayerItem(target_size=size, source_rel_path=relp, enabled=True))
       self.layers = sort_layers_desc(init_layers)
-
-      # No config means new directory: default output dir to input dir
       self.output_dir_var.set(default_out_dir)
 
-    # Always persist (keeps config updated + creates if missing)
     self.persist_config_if_possible()
     self.refresh_layer_rows()
 
@@ -648,10 +663,25 @@ class App(ctk.CTk):
         pass
     self._layer_rows = []
 
+  def _try_set_layer_size(self, idx: int, w_s: str, h_s: str) -> None:
+    """
+    Parse/validate width/height strings and update the layer target size if valid.
+    """
+    try:
+      w = int(str(w_s).strip())
+      h = int(str(h_s).strip())
+      if w <= 0 or h <= 0:
+        return
+      self.layers[idx].target_size = (w, h)
+      self.layers = sort_layers_desc(self.layers)
+      self.persist_config_if_possible()
+      self.refresh_layer_rows()
+    except Exception:
+      return
+
   def refresh_layer_rows(self) -> None:
     """
     Rebuild the scrollable layer list rows from self.layers.
-
     Always sorts largest → smallest.
     """
     self.layers = sort_layers_desc(self.layers)
@@ -672,41 +702,62 @@ class App(ctk.CTk):
       chk = ctk.CTkCheckBox(frame, text="", variable=enabled_var, command=_make_on_toggle(idx, enabled_var), width=24)
       chk.grid(row=0, column=0, padx=(8, 4), pady=8)
 
-      w, h = it.size
-      ctk.CTkLabel(frame, text=f"{w}x{h}", width=90).grid(row=0, column=1, padx=6, pady=8, sticky="w")
+      # Target size editors
+      tw, th = it.target_size
+      w_var = tk.StringVar(value=str(tw))
+      h_var = tk.StringVar(value=str(th))
+
+      ctk.CTkLabel(frame, text="Target:", width=60).grid(row=0, column=1, padx=(6, 2), pady=8, sticky="w")
+      ent_w = ctk.CTkEntry(frame, width=70, textvariable=w_var)
+      ent_w.grid(row=0, column=2, padx=(2, 2), pady=8, sticky="w")
+      ctk.CTkLabel(frame, text="x", width=14).grid(row=0, column=3, padx=(2, 2), pady=8, sticky="w")
+      ent_h = ctk.CTkEntry(frame, width=70, textvariable=h_var)
+      ent_h.grid(row=0, column=4, padx=(2, 10), pady=8, sticky="w")
+
+      def _make_on_size_commit(i: int, wv: tk.StringVar, hv: tk.StringVar):
+        def _commit(_evt=None):
+          self._try_set_layer_size(i, wv.get(), hv.get())
+        return _commit
+
+      ent_w.bind("<FocusOut>", _make_on_size_commit(idx, w_var, h_var))
+      ent_h.bind("<FocusOut>", _make_on_size_commit(idx, w_var, h_var))
+      ent_w.bind("<Return>", _make_on_size_commit(idx, w_var, h_var))
+      ent_h.bind("<Return>", _make_on_size_commit(idx, w_var, h_var))
 
       # Path + missing indicator
-      full = resolve_path(self.input_dir, it.rel_path) if self.input_dir else it.rel_path
+      full = resolve_path(self.input_dir, it.source_rel_path) if self.input_dir else it.source_rel_path
       missing = (self.input_dir and not os.path.isfile(full))
 
-      path_text = it.rel_path
+      path_text = it.source_rel_path
       if missing:
         path_text += "  (MISSING)"
 
       lbl = ctk.CTkLabel(frame, text=path_text, anchor="w")
-      lbl.grid(row=0, column=2, padx=6, pady=8, sticky="ew")
+      lbl.grid(row=0, column=5, padx=6, pady=8, sticky="ew")
 
-      def _make_on_replace(i: int):
-        def _on_replace():
+      def _make_on_pick_file(i: int):
+        def _on_pick():
           self.on_replace_layer_file(i)
-        return _on_replace
+        return _on_pick
 
       def _make_on_remove(i: int):
         def _on_remove():
           self.on_remove_layer(i)
         return _on_remove
 
-      btn_replace = ctk.CTkButton(frame, text="Replace…", command=_make_on_replace(idx), width=110)
-      btn_replace.grid(row=0, column=3, padx=6, pady=8)
+      btn_pick = ctk.CTkButton(frame, text="File…", command=_make_on_pick_file(idx), width=90)
+      btn_pick.grid(row=0, column=6, padx=6, pady=8)
 
       btn_remove = ctk.CTkButton(frame, text="Remove", command=_make_on_remove(idx), width=90)
-      btn_remove.grid(row=0, column=4, padx=(6, 8), pady=8)
+      btn_remove.grid(row=0, column=7, padx=(6, 8), pady=8)
 
-      frame.grid_columnconfigure(2, weight=1)
+      frame.grid_columnconfigure(5, weight=1)
 
       self._layer_rows.append({
         "frame": frame,
         "enabled_var": enabled_var,
+        "w_var": w_var,
+        "h_var": h_var,
       })
 
   # ---------------------------------------------------------------------------
@@ -714,7 +765,7 @@ class App(ctk.CTk):
   # ---------------------------------------------------------------------------
 
   def on_browse_input_dir(self) -> None:
-    p = filedialog.askdirectory(title="Select input directory (contains layers + config.json)")
+    p = filedialog.askdirectory(title="Select input directory (contains config.json)")
     if not p:
       return
     self.input_dir_var.set(os.path.abspath(p))
@@ -750,79 +801,64 @@ class App(ctk.CTk):
     """
     Add a new layer by selecting a PNG file.
 
-    Requirement enforced:
-    - Filename must contain a WxH token. Otherwise reject.
+    New behavior:
+    - Any PNG is allowed (no filename token required).
+    - Initial target size is chosen by:
+      1) WxH token in filename, else
+      2) actual PNG dimensions.
     """
     if not self.input_dir or not os.path.isdir(self.input_dir):
       messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
       return
 
     p = filedialog.askopenfilename(
-      title="Select layer PNG (filename must contain WxH token)",
+      title="Select layer PNG (any PNG; target size is editable)",
       initialdir=self.input_dir,
       filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
     )
     if not p:
       return
 
-    size = parse_size_token(os.path.basename(p))
-    if not size:
-      messagebox.showerror(APP_TITLE, "That filename does not contain a WxH token (e.g., 128x128). Rename the file first.")
-      return
-
-    # Prefer keeping layer files inside the input dir (config locality).
     p_abs = os.path.abspath(p)
-    in_abs = os.path.abspath(self.input_dir)
-    try:
-      rel = os.path.relpath(p_abs, in_abs)
-      if rel.startswith(".."):
-        messagebox.showerror(APP_TITLE, "Layer file must be inside the selected input directory.")
-        return
-    except Exception:
-      messagebox.showerror(APP_TITLE, "Failed to validate layer path; ensure it is inside the input directory.")
-      return
-
     rel_path = normalize_relpath(self.input_dir, p_abs)
 
-    # If size already exists, add another entry (allowed), but it will be de-duped at build-time.
-    self.layers.append(LayerItem(size=size, rel_path=rel_path, enabled=True))
+    size = parse_size_token(os.path.basename(p_abs))
+    if not size:
+      size = infer_png_size(p_abs)
+
+    if not size:
+      messagebox.showerror(APP_TITLE, "Could not read PNG dimensions. The file may be invalid.")
+      return
+
+    self.layers.append(LayerItem(target_size=size, source_rel_path=rel_path, enabled=True))
     self.layers = sort_layers_desc(self.layers)
 
     self.persist_config_if_possible()
     self.refresh_layer_rows()
 
   def on_replace_layer_file(self, idx: int) -> None:
+    """
+    Pick/replace the source PNG for a layer.
+
+    Notes:
+    - Any PNG is allowed.
+    - Target size is NOT changed automatically (you control it via the Target W/H fields).
+    """
     if not self.input_dir or not os.path.isdir(self.input_dir):
       messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
       return
 
     current = self.layers[idx]
     p = filedialog.askopenfilename(
-      title="Select replacement layer PNG (filename must contain WxH token)",
+      title="Select source PNG for this layer",
       initialdir=self.input_dir,
       filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
     )
     if not p:
       return
 
-    size = parse_size_token(os.path.basename(p))
-    if not size:
-      messagebox.showerror(APP_TITLE, "That filename does not contain a WxH token (e.g., 128x128). Rename the file first.")
-      return
-
     p_abs = os.path.abspath(p)
-    in_abs = os.path.abspath(self.input_dir)
-    try:
-      rel = os.path.relpath(p_abs, in_abs)
-      if rel.startswith(".."):
-        messagebox.showerror(APP_TITLE, "Replacement file must be inside the selected input directory.")
-        return
-    except Exception:
-      messagebox.showerror(APP_TITLE, "Failed to validate layer path; ensure it is inside the input directory.")
-      return
-
-    current.size = size
-    current.rel_path = normalize_relpath(self.input_dir, p_abs)
+    current.source_rel_path = normalize_relpath(self.input_dir, p_abs)
 
     self.layers = sort_layers_desc(self.layers)
     self.persist_config_if_possible()
@@ -849,24 +885,29 @@ class App(ctk.CTk):
       messagebox.showerror(APP_TITLE, "Output directory is required.")
       return
 
-    # Validate that enabled files exist and are valid PNGs (light check).
     enabled = [it for it in self.layers if it.enabled]
     if not enabled:
       messagebox.showerror(APP_TITLE, "No layers are enabled.")
       return
 
-    # Optional: verify PNG decode for enabled layers (fast sanity).
+    # Sanity checks: paths exist + PNG decode + target sizes valid.
     bad: List[str] = []
     for it in enabled:
-      full = resolve_path(self.input_dir, it.rel_path)
-      if not os.path.isfile(full):
-        bad.append(f"{it.rel_path} (missing)")
+      tw, th = it.target_size
+      if tw <= 0 or th <= 0:
+        bad.append(f"{it.source_rel_path} (invalid target size {tw}x{th})")
         continue
+
+      full = resolve_path(self.input_dir, it.source_rel_path)
+      if not os.path.isfile(full):
+        bad.append(f"{it.source_rel_path} (missing)")
+        continue
+
       try:
         with Image.open(full) as img:
           img.verify()
       except Exception:
-        bad.append(f"{it.rel_path} (invalid PNG)")
+        bad.append(f"{it.source_rel_path} (invalid PNG)")
 
     if bad:
       messagebox.showerror(APP_TITLE, "Some enabled layers are invalid:\n\n" + "\n".join(bad))
