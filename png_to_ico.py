@@ -312,6 +312,100 @@ def layers_from_config(data: dict) -> List[LayerItem]:
 
 
 # =============================================================================
+# Default target sizes (largest → smallest)
+# =============================================================================
+
+STANDARD_TARGET_SIZES = [256, 128, 64, 48, 32, 16]
+
+
+def gather_png_sources_with_dims(input_dir: str) -> List[Tuple[int, int, str]]:
+  """
+  Collect candidate PNG sources in the input dir with actual dimensions.
+
+  Returns
+  - list of (w, h, rel_path)
+  """
+  out: List[Tuple[int, int, str]] = []
+  if not input_dir or not os.path.isdir(input_dir):
+    return out
+
+  for name in os.listdir(input_dir):
+    if not name.lower().endswith(".png"):
+      continue
+
+    full = os.path.join(input_dir, name)
+    if not os.path.isfile(full):
+      continue
+
+    # Prefer filename token, else read actual size
+    size = parse_size_token(name)
+    if not size:
+      size = infer_png_size(full)
+    if not size:
+      continue
+
+    w, h = size
+    if w <= 0 or h <= 0:
+      continue
+
+    out.append((w, h, normalize_relpath(input_dir, full)))
+
+  return out
+
+
+def pick_largest_qualifying_source(
+  target: Tuple[int, int],
+  sources: List[Tuple[int, int, str]],
+) -> Optional[str]:
+  """
+  For a given target (tw, th), pick:
+  - the LARGEST source that qualifies (w>=tw and h>=th)
+  - else the LARGEST source overall (fallback)
+  """
+  if not sources:
+    return None
+
+  tw, th = target
+
+  qualifying = [(w, h, p) for (w, h, p) in sources if w >= tw and h >= th]
+  pool = qualifying if qualifying else sources
+
+  # Largest by area, then by width/height
+  w, h, p = max(pool, key=lambda x: (x[0] * x[1], x[0], x[1]))
+  return p
+
+
+def build_default_layers_from_sources(input_dir: str) -> List[LayerItem]:
+  """
+  Create default layer rows (targets) based on what sources exist.
+  - Includes standard targets up to the largest available dimension.
+  - Always returns at least [16,32,48,64,128] if possible, and 256 if available.
+  - Each row gets auto-assigned a best source file.
+  """
+  sources = gather_png_sources_with_dims(input_dir)
+  if not sources:
+    return []
+
+  # Use the largest "square-safe" dimension for deciding which targets to include
+  max_square_dim = max(min(w, h) for (w, h, _p) in sources)
+
+  targets = [s for s in STANDARD_TARGET_SIZES if s <= max_square_dim]
+  if not targets:
+    # If nothing reaches 16x16, still create 16 as a target and fallback to largest source
+    targets = [16]
+
+  layers: List[LayerItem] = []
+  for s in targets:
+    target = (s, s)
+    best = pick_largest_qualifying_source(target, sources)
+    if not best:
+      continue
+    layers.append(LayerItem(target_size=target, source_rel_path=best, enabled=True))
+
+  return sort_layers_desc(layers)
+
+
+# =============================================================================
 # Discovery / merge rules
 # =============================================================================
 
@@ -642,10 +736,16 @@ class App(ctk.CTk):
 
       self.layers = sort_layers_desc(merged)
     else:
-      init_layers: List[LayerItem] = []
-      for size, relp in discovered.items():
-        init_layers.append(LayerItem(target_size=size, source_rel_path=relp, enabled=True))
-      self.layers = sort_layers_desc(init_layers)
+      # NEW: Default layer rows + auto-pick best source for each target.
+      self.layers = build_default_layers_from_sources(self.input_dir)
+
+      # Fallback: if no readable PNGs, keep old discovery behavior
+      if not self.layers:
+        init_layers: List[LayerItem] = []
+        for size, relp in discovered.items():
+          init_layers.append(LayerItem(target_size=size, source_rel_path=relp, enabled=True))
+        self.layers = sort_layers_desc(init_layers)
+
       self.output_dir_var.set(default_out_dir)
 
     self.persist_config_if_possible()
