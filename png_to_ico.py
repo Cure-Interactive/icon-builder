@@ -17,11 +17,11 @@ Layer rules
 - At build time, each enabled layer is resized to its configured target size (if needed).
 
 Config behavior
-- A `config.json` is stored INSIDE the selected input directory.
+- A `png_to_ico.json` is stored INSIDE the selected input directory.
 - When an input directory is selected:
-  - If `config.json` exists, it is loaded and used to populate UI + selections.
-  - If missing, the UI is populated from discovered layers and written to `config.json`.
-- The program keeps `config.json` updated whenever:
+  - If `png_to_ico.json` exists, it is loaded and used to populate UI + selections.
+  - If missing, the UI is populated from discovered layers and written to `png_to_ico.json`.
+- The program keeps `png_to_ico.json` updated whenever:
   - layer list changes
   - enabled state changes
   - file path changes
@@ -94,7 +94,7 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # =============================================================================
 
 APP_TITLE = "PNG to ICO"
-CONFIG_FILENAME = "config.json"
+CONFIG_FILENAME = "png_to_ico.json"
 
 # Match "000x000" style tokens anywhere in filename (1-4 digits each).
 SIZE_TOKEN_RE = re.compile(r"(?P<w>\d{1,4})x(?P<h>\d{1,4})", re.IGNORECASE)
@@ -233,14 +233,14 @@ def resolve_path(input_dir: str, rel_or_abs: str) -> str:
 
 def config_path_for_input_dir(input_dir: str) -> str:
   """
-  Get config.json full path inside input directory.
+  Get png_to_ico.json full path inside input directory.
   """
   return os.path.join(os.path.abspath(input_dir), CONFIG_FILENAME)
 
 
 def load_config(input_dir: str) -> Optional[dict]:
   """
-  Load config.json from input directory, if it exists.
+  Load png_to_ico.json from input directory, if it exists.
 
   Returns
   - dict if loaded; otherwise None.
@@ -258,7 +258,7 @@ def load_config(input_dir: str) -> Optional[dict]:
 
 def save_config(input_dir: str, data: dict) -> None:
   """
-  Save config.json in the input directory.
+  Save png_to_ico.json in the input directory.
   Intended to be called often to "keep config updated".
   """
   p = config_path_for_input_dir(input_dir)
@@ -271,7 +271,7 @@ def save_config(input_dir: str, data: dict) -> None:
 
 def layers_to_config(layers: List[LayerItem]) -> List[dict]:
   """
-  Serialize layer items for config.json.
+  Serialize layer items for png_to_ico.json.
   """
   out: List[dict] = []
   for it in layers:
@@ -289,7 +289,7 @@ def layers_to_config(layers: List[LayerItem]) -> List[dict]:
 
 def layers_from_config(data: dict) -> List[LayerItem]:
   """
-  Deserialize layer items from config.json structure.
+  Deserialize layer items from png_to_ico.json structure.
 
   Accepts:
   - "target_size" (preferred) or "size" (legacy)
@@ -602,7 +602,7 @@ class App(ctk.CTk):
   CustomTkinter application for managing layers and building ICO files.
 
   UI features
-  - Select input directory (contains config.json, may contain discovered layers).
+  - Select input directory (contains png_to_ico.json, may contain discovered layers).
   - Rescan layers (auto-discovery from filenames containing WxH).
   - Per-layer controls:
     - Enable/disable
@@ -646,7 +646,7 @@ class App(ctk.CTk):
 
     self.input_dir_var = tk.StringVar(value="")
 
-    ctk.CTkLabel(self.top, text="Input Directory (layers + config.json):").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+    ctk.CTkLabel(self.top, text="Input Directory (layers + png_to_ico.json):").grid(row=0, column=0, sticky="w", padx=8, pady=8)
     self.input_entry = ctk.CTkEntry(self.top, textvariable=self.input_dir_var)
     self.input_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
 
@@ -875,7 +875,7 @@ class App(ctk.CTk):
   # ---------------------------------------------------------------------------
 
   def on_browse_input_dir(self) -> None:
-    p = filedialog.askdirectory(title="Select input directory (contains config.json)")
+    p = filedialog.askdirectory(title="Select input directory (contains png_to_ico.json)")
     if not p:
       return
     self.input_dir_var.set(os.path.abspath(p))
