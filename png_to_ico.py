@@ -95,6 +95,8 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 
 APP_TITLE = "PNG to ICO"
 CONFIG_FILENAME = "png_to_ico.json"
+APP_CONFIG_FILENAME = "config.json"
+APP_CONFIG_PATH = os.path.join(SCRIPT_ROOT_DIR, APP_CONFIG_FILENAME)
 
 # Match "000x000" style tokens anywhere in filename (1-4 digits each).
 SIZE_TOKEN_RE = re.compile(r"(?P<w>\d{1,4})x(?P<h>\d{1,4})", re.IGNORECASE)
@@ -267,6 +269,54 @@ def save_config(input_dir: str, data: dict) -> None:
       json.dump(data, f, indent=2)
   except Exception as e:
     logging.warning("Failed to save config: %s (%s)", p, e)
+
+
+def _read_json(path: str) -> dict:
+  try:
+    if not os.path.isfile(path):
+      return {}
+    with open(path, "r", encoding="utf-8") as f:
+      data = json.load(f)
+    return data if isinstance(data, dict) else {}
+  except Exception:
+    return {}
+
+
+def _write_json_atomic(path: str, data: dict) -> None:
+  try:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+      json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+  except Exception:
+    # Best-effort; app should still run
+    return
+
+
+def _norm_dir(p: str) -> str:
+  return os.path.normpath(os.path.abspath(p))
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+  seen = set()
+  out: List[str] = []
+  for x in items:
+    if x in seen:
+      continue
+    seen.add(x)
+    out.append(x)
+  return out
+
+
+def _filter_existing_dirs(items: List[str]) -> List[str]:
+  out: List[str] = []
+  for p in items:
+    try:
+      if os.path.isdir(p):
+        out.append(p)
+    except Exception:
+      pass
+  return out
 
 
 def layers_to_config(layers: List[LayerItem]) -> List[dict]:
@@ -618,7 +668,11 @@ class App(ctk.CTk):
   def __init__(self) -> None:
     super().__init__()
 
-    set_window_icon(self, "icon.ico", "icon.png")
+    set_window_icon(
+      self,
+      os.path.join(SCRIPT_ROOT_DIR, "icon.ico"),
+      os.path.join(SCRIPT_ROOT_DIR, "icon.png"),
+    )
 
     ctk.set_appearance_mode("Dark")
     ctk.set_default_color_theme("blue")
@@ -628,6 +682,36 @@ class App(ctk.CTk):
 
     self.input_dir: str = ""
     self.layers: List[LayerItem] = []
+
+    # Recent input directories (stored beside this script, not in the input dir)
+    app_cfg = _read_json(APP_CONFIG_PATH)
+    self.recent_input_dirs_max = int(app_cfg.get("recent_input_dirs_max", 10) or 10)
+    if self.recent_input_dirs_max <= 0:
+      self.recent_input_dirs_max = 10
+
+    raw = app_cfg.get("recent_input_dirs", [])
+    if not isinstance(raw, list):
+      raw = []
+
+    self.recent_input_dirs: List[str] = []
+    for p in raw:
+      if isinstance(p, str) and p.strip():
+        self.recent_input_dirs.append(_norm_dir(p.strip()))
+
+    self.recent_input_dirs = _dedupe_keep_order(self.recent_input_dirs)
+    self.recent_input_dirs = _filter_existing_dirs(self.recent_input_dirs)
+    self.recent_input_dirs = self.recent_input_dirs[: self.recent_input_dirs_max]
+
+    self.recent_input_dir_var = tk.StringVar(
+      value=(self.recent_input_dirs[0] if self.recent_input_dirs else "(none)")
+    )
+
+    # Recent list UX state
+    self.recent_max_var = tk.StringVar(value=str(self.recent_input_dirs_max))
+    self._loading_recent_select = False
+
+    # Persist cleaned startup state
+    self._persist_app_config()
 
     self.output_dir_var = tk.StringVar(value=os.path.abspath(os.getcwd()))
     self.output_name_var = tk.StringVar(value="icon.ico")
@@ -644,10 +728,27 @@ class App(ctk.CTk):
     self.top = ctk.CTkFrame(self)
     self.top.pack(fill="x", padx=12, pady=(12, 6))
 
-    self.input_dir_var = tk.StringVar(value="")
+    # Editable dropdown: user can type a path, or pick from recent history.
+    self.input_dir_var = tk.StringVar(
+      value=(self.recent_input_dirs[0] if getattr(self, "recent_input_dirs", None) else "")
+    )
 
-    ctk.CTkLabel(self.top, text="Input Directory (layers + png_to_ico.json):").grid(row=0, column=0, sticky="w", padx=8, pady=8)
-    self.input_entry = ctk.CTkEntry(self.top, textvariable=self.input_dir_var)
+    ctk.CTkLabel(self.top, text="Input Directory:").grid(
+      row=0,
+      column=0,
+      sticky="w",
+      padx=8,
+      pady=8,
+    )
+
+    # ttk.Combobox is the most reliable "string field dropdown" across CTk versions.
+    self.input_entry = ctk.CTkComboBox(
+      self.top,
+      variable=self.input_dir_var,
+      values=list(self.recent_input_dirs) if self.recent_input_dirs else [],
+      command=self._on_input_dir_combo_selected,
+      state="normal",
+    )
     self.input_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
 
     self.btn_browse_input = ctk.CTkButton(self.top, text="Browse…", command=self.on_browse_input_dir, width=110)
@@ -658,6 +759,10 @@ class App(ctk.CTk):
 
     self.btn_rescan = ctk.CTkButton(self.top, text="Rescan Layers", command=self.on_rescan_layers, width=130)
     self.btn_rescan.grid(row=0, column=4, padx=8, pady=8)
+
+    # Keep the "clear history" functionality, just move it onto the top row.
+    self.btn_clear_recent = ctk.CTkButton(self.top, text="Clear History", command=self.on_clear_recent, width=120)
+    self.btn_clear_recent.grid(row=0, column=5, padx=8, pady=8)
 
     self.top.grid_columnconfigure(1, weight=1)
 
@@ -691,8 +796,8 @@ class App(ctk.CTk):
     ctk.CTkButton(self.bottom, text="Browse…", command=self.on_browse_output_dir, width=110).grid(row=0, column=2, padx=8, pady=8)
 
     ctk.CTkLabel(self.bottom, text="ICO Name:").grid(row=1, column=0, sticky="w", padx=8, pady=8)
-    self.out_name_entry = ctk.CTkEntry(self.bottom, textvariable=self.output_name_var, width=220)
-    self.out_name_entry.grid(row=1, column=1, sticky="w", padx=8, pady=8)
+    self.out_name_entry = ctk.CTkEntry(self.bottom, textvariable=self.output_name_var)
+    self.out_name_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=8)
 
     self.btn_build = ctk.CTkButton(self.bottom, text="Build ICO", command=self.on_build_ico, width=140)
     self.btn_build.grid(row=1, column=2, padx=8, pady=8)
@@ -874,6 +979,156 @@ class App(ctk.CTk):
   # UI callbacks
   # ---------------------------------------------------------------------------
 
+  def _persist_app_config(self) -> None:
+    """
+    Persist app-level config (recent dirs + max) beside this script.
+    """
+    _write_json_atomic(APP_CONFIG_PATH, {
+      "recent_input_dirs_max": int(self.recent_input_dirs_max),
+      "recent_input_dirs": list(self.recent_input_dirs),
+    })
+
+  def _update_recent_menu(self) -> None:
+    """
+    Refresh the option menu values to match self.recent_input_dirs.
+    """
+    values = self.recent_input_dirs if self.recent_input_dirs else ["(none)"]
+    try:
+      self.recent_menu.configure(values=values)
+    except Exception:
+      pass
+
+    # If current selection is invalid, force a safe value
+    cur = str(self.recent_input_dir_var.get() or "").strip()
+    if not cur or cur not in values:
+      self.recent_input_dir_var.set(values[0])
+
+  def _remember_input_dir(self, p: str) -> None:
+    """
+    Add directory to recent list (front), dedupe, trim to max, persist + refresh UI.
+    """
+    if not p:
+      return
+
+    p_norm = _norm_dir(p)
+    if not os.path.isdir(p_norm):
+      return
+
+    # Move to front
+    items = [p_norm] + [x for x in self.recent_input_dirs if x != p_norm]
+    items = _dedupe_keep_order(items)
+    items = _filter_existing_dirs(items)
+    items = items[: self.recent_input_dirs_max]
+
+    self.recent_input_dirs = items
+
+    # Avoid triggering on_recent_selected while we programmatically set it
+    self._loading_recent_select = True
+    try:
+      self.recent_input_dir_var.set(p_norm)
+      self._update_recent_menu()
+    finally:
+      self._loading_recent_select = False
+
+    self._persist_app_config()
+
+  def _apply_recent_max_from_entry(self) -> None:
+    """
+    Parse/validate 'Keep last' entry, update max + trim list + persist + refresh menu.
+    """
+    raw = str(self.recent_max_var.get() or "").strip()
+    try:
+      n = int(raw)
+    except Exception:
+      n = self.recent_input_dirs_max
+
+    # Clamp to sane bounds
+    if n <= 0:
+      n = 1
+    if n > 200:
+      n = 200
+
+    self.recent_input_dirs_max = n
+    self.recent_max_var.set(str(n))
+
+    # Trim list to new max
+    self.recent_input_dirs = self.recent_input_dirs[: self.recent_input_dirs_max]
+    self._update_recent_menu()
+    self._persist_app_config()
+
+  def on_recent_selected(self, choice: str) -> None:
+    """
+    OptionMenu callback: selecting a recent dir loads it.
+    """
+    if self._loading_recent_select:
+      return
+
+    p = str(choice or "").strip()
+    if not p or p == "(none)":
+      return
+
+    if not os.path.isdir(p):
+      # Remove dead entry and refresh
+      self.recent_input_dirs = [x for x in self.recent_input_dirs if x != p]
+      self._update_recent_menu()
+      self._persist_app_config()
+      messagebox.showerror(APP_TITLE, f"Recent directory no longer exists:\n\n{p}")
+      return
+
+    self.input_dir_var.set(p)
+    self._remember_input_dir(p)
+    self.load_or_init_from_input_dir(p)
+
+  def on_clear_recent(self) -> None:
+    """
+    Clear recent dir history.
+    """
+    self.recent_input_dirs = []
+    self._loading_recent_select = True
+    try:
+      self.recent_input_dir_var.set("(none)")
+      self._update_recent_menu()
+    finally:
+      self._loading_recent_select = False
+
+    self._persist_app_config()
+
+  def _persist_recent_input_dirs(self) -> None:
+    _write_json_atomic(APP_CONFIG_PATH, {
+      "recent_input_dirs_max": int(self.recent_input_dirs_max),
+      "recent_input_dirs": list(self.recent_input_dirs),
+    })
+
+  def _refresh_input_dir_dropdown(self) -> None:
+    self.input_entry.configure(values=list(self.recent_input_dirs))
+
+  def _remember_input_dir(self, p: str) -> None:
+    if not p:
+      return
+
+    p_norm = _norm_dir(p)
+    if not os.path.isdir(p_norm):
+      return
+
+    # Move to front + dedupe + trim
+    items = [p_norm] + [x for x in self.recent_input_dirs if x != p_norm]
+    items = _dedupe_keep_order(items)
+    items = _filter_existing_dirs(items)
+    items = items[: self.recent_input_dirs_max]
+
+    self.recent_input_dirs = items
+    self._persist_recent_input_dirs()
+    self._refresh_input_dir_dropdown()
+
+  def _on_input_dir_combo_selected(self, choice: str) -> None:
+    # When user picks a recent dir from dropdown, load it immediately.
+    self.on_load_input_dir()
+
+  def on_clear_recent(self) -> None:
+    self.recent_input_dirs = []
+    self._persist_recent_input_dirs()
+    self._refresh_input_dir_dropdown()
+
   def on_browse_input_dir(self) -> None:
     p = filedialog.askdirectory(title="Select input directory (contains png_to_ico.json)")
     if not p:
@@ -886,6 +1141,8 @@ class App(ctk.CTk):
     if not p or not os.path.isdir(p):
       messagebox.showerror(APP_TITLE, "Input directory is missing or invalid.")
       return
+
+    self._remember_input_dir(p)
     self.load_or_init_from_input_dir(p)
 
   def on_rescan_layers(self) -> None:
