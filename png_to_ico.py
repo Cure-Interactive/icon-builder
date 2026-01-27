@@ -375,6 +375,9 @@ def layers_from_config(data: dict) -> List[LayerItem]:
 # Default target sizes (largest → smallest)
 # =============================================================================
 
+# Windows ICO standard max size is 256x256 for widest compatibility.
+ICO_MAX_PNG_SIZE = 256
+
 STANDARD_TARGET_SIZES = [256, 128, 64, 48, 32, 16]
 
 
@@ -616,6 +619,13 @@ def build_ico_from_layers(
       tw, th = it.target_size
       if tw <= 0 or th <= 0:
         raise ValueError(f"Invalid target size for layer: {tw}x{th}")
+
+      if tw > ICO_MAX_PNG_SIZE or th > ICO_MAX_PNG_SIZE:
+        raise ValueError(
+          f"Invalid ICO layer size {tw}x{th}. "
+          f"Max supported size is {ICO_MAX_PNG_SIZE}x{ICO_MAX_PNG_SIZE}. "
+          "Set the Target size to 256 or smaller."
+        )
 
       with Image.open(full) as img:
         img = img.convert("RGBA")
@@ -887,6 +897,15 @@ class App(ctk.CTk):
       h = int(str(h_s).strip())
       if w <= 0 or h <= 0:
         return
+
+      if w > ICO_MAX_PNG_SIZE or h > ICO_MAX_PNG_SIZE:
+        messagebox.showerror(
+          APP_TITLE,
+          f"Invalid ICO target size {w}x{h}.\n\n"
+          f"Max supported size is {ICO_MAX_PNG_SIZE}x{ICO_MAX_PNG_SIZE}."
+        )
+        return
+
       self.layers[idx].target_size = (w, h)
       self.layers = sort_layers_desc(self.layers)
       self.persist_config_if_possible()
@@ -1197,7 +1216,13 @@ class App(ctk.CTk):
       messagebox.showerror(APP_TITLE, "Could not read PNG dimensions. The file may be invalid.")
       return
 
+    w0, h0 = size
+    if w0 > ICO_MAX_PNG_SIZE or h0 > ICO_MAX_PNG_SIZE:
+      # Default to a sane ICO target instead of inheriting a too-large source dimension.
+      size = (ICO_MAX_PNG_SIZE, ICO_MAX_PNG_SIZE)
+
     self.layers.append(LayerItem(target_size=size, source_rel_path=rel_path, enabled=True))
+
     self.layers = sort_layers_desc(self.layers)
 
     self.persist_config_if_possible()
