@@ -723,9 +723,11 @@ class App(ctk.CTk):
 
     # Recent input directories (stored beside this script, not in the input dir)
     app_cfg = _read_json(APP_CONFIG_PATH)
-    self.recent_input_dirs_max = int(app_cfg.get("recent_input_dirs_max", 10) or 10)
+
+    # Support 16 previous dirs by default.
+    self.recent_input_dirs_max = int(app_cfg.get("recent_input_dirs_max", 16) or 16)
     if self.recent_input_dirs_max <= 0:
-      self.recent_input_dirs_max = 10
+      self.recent_input_dirs_max = 16
 
     raw = app_cfg.get("recent_input_dirs", [])
     if not isinstance(raw, list):
@@ -757,6 +759,21 @@ class App(ctk.CTk):
     self._build_top_controls()
     self._build_layers_editor()
     self._build_bottom_controls()
+
+    # Auto-load the most recent project (if any) on startup.
+    if self.recent_input_dirs:
+      try:
+        self.load_or_init_from_input_dir(self.recent_input_dirs[0])
+      except Exception as e:
+        logging.warning("Auto-load recent project failed: %s", e)
+
+    # Auto-load most recent project (if any) on startup.
+    try:
+      if self.recent_input_dirs and os.path.isdir(self.recent_input_dirs[0]):
+        self.load_or_init_from_input_dir(self.recent_input_dirs[0])
+    except Exception:
+      # Best-effort startup behavior; do not prevent app launch.
+      pass
 
   # ---------------------------------------------------------------------------
   # UI construction
@@ -879,8 +896,21 @@ class App(ctk.CTk):
       out_dir = cfg.get("output_dir")
       out_name = cfg.get("output_name")
 
+      # If project config contains an invalid output directory:
+      # - alert the user
+      # - after OK, reset output to the selected project directory
       if isinstance(out_dir, str) and out_dir.strip():
-        self.output_dir_var.set(out_dir)
+        out_dir_abs = os.path.abspath(out_dir.strip())
+        if os.path.isdir(out_dir_abs):
+          self.output_dir_var.set(out_dir_abs)
+        else:
+          messagebox.showwarning(
+            APP_TITLE,
+            "Output directory in this project's config is invalid:\n\n"
+            f"{out_dir_abs}\n\n"
+            "It will be reset to the project directory."
+          )
+          self.output_dir_var.set(default_out_dir)
       else:
         self.output_dir_var.set(default_out_dir)
 
@@ -1185,7 +1215,9 @@ class App(ctk.CTk):
     self._refresh_input_dir_dropdown()
 
   def on_browse_input_dir(self) -> None:
-    p = filedialog.askdirectory(title="Select input directory (contains png_to_ico.json)")
+    cur = str(self.input_dir_var.get() or "").strip()
+    initialdir = cur if (cur and os.path.isdir(cur)) else (self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd()))
+    p = filedialog.askdirectory(title="Select input directory (contains png_to_ico.json)", initialdir=initialdir)
     if not p:
       return
     self.input_dir_var.set(os.path.abspath(p))
@@ -1214,7 +1246,9 @@ class App(ctk.CTk):
     self.refresh_layer_rows()
 
   def on_browse_output_dir(self) -> None:
-    p = filedialog.askdirectory(title="Select output directory")
+    cur = str(self.output_dir_var.get() or "").strip()
+    initialdir = cur if (cur and os.path.isdir(cur)) else (self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd()))
+    p = filedialog.askdirectory(title="Select output directory", initialdir=initialdir)
     if not p:
       return
     self.output_dir_var.set(os.path.abspath(p))
