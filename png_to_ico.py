@@ -93,7 +93,8 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # Constants / Regex
 # =============================================================================
 
-APP_TITLE = "PNG to ICO"
+APP_TITLE = "PNG to ICO - Cure Interactive"
+APP_USER_MODEL_ID = "CureInteractive.PNGToICO"
 CONFIG_FILENAME = "png_to_ico.json"
 APP_CONFIG_FILENAME = "config.json"
 APP_CONFIG_PATH = os.path.join(SCRIPT_ROOT_DIR, APP_CONFIG_FILENAME)
@@ -101,6 +102,33 @@ APP_CONFIG_PATH = os.path.join(SCRIPT_ROOT_DIR, APP_CONFIG_FILENAME)
 # Match "000x000" style tokens anywhere in filename (1-4 digits each).
 SIZE_TOKEN_RE = re.compile(r"(?P<w>\d{1,4})x(?P<h>\d{1,4})", re.IGNORECASE)
 
+# =============================================================================
+# Windows Taskbar Identity (AppUserModelID)
+# =============================================================================
+
+def set_windows_app_user_model_id(app_id: str) -> None:
+  """
+  Set an explicit Windows AppUserModelID for this process.
+
+  Why this matters:
+  - Windows uses AppUserModelID for taskbar grouping and (often) which icon is shown.
+  - Without it, you may see the python.exe icon or inconsistent taskbar behavior.
+
+  Notes:
+  - No-op on non-Windows.
+  - Best called BEFORE creating the Tk/CTk window (i.e., early in main()).
+  """
+  try:
+    if os.name != "nt":
+      return
+
+    import ctypes  # stdlib
+
+    # Windows API: https://learn.microsoft.com/windows/win32/shell/appids
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id))
+  except Exception:
+    # Best-effort; app should still run
+    return
 
 # =============================================================================
 # Window Icon (title bar / taskbar best-effort)
@@ -958,11 +986,19 @@ class App(ctk.CTk):
       ent_w.bind("<Return>", _make_on_size_commit(idx, w_var, h_var))
       ent_h.bind("<Return>", _make_on_size_commit(idx, w_var, h_var))
 
-      # Path + missing indicator
+      # Path + missing indicator (+ actual PNG dimensions after the name)
       full = resolve_path(self.input_dir, it.source_rel_path) if self.input_dir else it.source_rel_path
       missing = (self.input_dir and not os.path.isfile(full))
 
       path_text = it.source_rel_path
+
+      # If the file exists, append its actual pixel dimensions after the filename.
+      if not missing and full and os.path.isfile(full):
+        size = infer_png_size(full)
+        if size:
+          sw, sh = size
+          path_text += f"  ({sw}x{sh})"
+
       if missing:
         path_text += "  (MISSING)"
 
@@ -1324,6 +1360,9 @@ class App(ctk.CTk):
 # =============================================================================
 
 def main() -> int:
+  # Must happen early for best taskbar behavior on Windows.
+  set_windows_app_user_model_id(APP_USER_MODEL_ID)
+
   app = App()
   app.mainloop()
   return 0
