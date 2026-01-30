@@ -365,7 +365,7 @@ def layers_to_config(layers: List[LayerItem]) -> List[dict]:
   return out
 
 
-def layers_from_config(data: dict) -> List[LayerItem]:
+def layers_from_config(data: dict, *, max_size: int) -> List[LayerItem]:
   """
   Deserialize layer items from png_to_ico.json structure.
 
@@ -394,6 +394,11 @@ def layers_from_config(data: dict) -> List[LayerItem]:
     if not size:
       continue
 
+    # Reject targets larger than the active target sizes max.
+    w, h = size
+    if w > max_size or h > max_size:
+      continue
+
     out.append(LayerItem(target_size=size, source_rel_path=p, enabled=en))
 
   return out
@@ -406,7 +411,90 @@ def layers_from_config(data: dict) -> List[LayerItem]:
 # Windows ICO standard max size is 256x256 for widest compatibility.
 ICO_MAX_PNG_SIZE = 256
 
-STANDARD_TARGET_SIZES = [256, 128, 64, 48, 32, 16]
+STANDARD_TARGET_SIZES = [256, 128, 64, 48, 32, 24, 16]
+
+
+def _sanitize_target_sizes(values) -> List[int]:
+  """
+  Normalize a user-provided target size list into a safe, descending, de-duped list.
+
+  Rules
+  - list[int|str] only (anything else => ignored)
+  - clamp to 1..ICO_MAX_PNG_SIZE
+  - de-dupe
+  - sort descending (largest → smallest)
+  """
+  if not isinstance(values, list):
+    return []
+
+  out: List[int] = []
+  seen = set()
+
+  for v in values:
+    try:
+      n = int(v)
+    except Exception:
+      continue
+
+    if n <= 0 or n > ICO_MAX_PNG_SIZE:
+      continue
+
+    if n in seen:
+      continue
+
+    seen.add(n)
+    out.append(n)
+
+  out.sort(reverse=True)
+  return out
+
+
+def _sizes_to_csv(sizes: List[int]) -> str:
+  return ",".join(str(x) for x in sizes)
+
+
+def _csv_to_sizes(text: str) -> List[int]:
+  raw = str(text or "").strip()
+  if not raw:
+    return []
+  parts = [p.strip() for p in raw.split(",")]
+  return _sanitize_target_sizes(parts)
+
+
+def resolve_standard_target_sizes(project_cfg: Optional[dict], app_cfg: Optional[dict]) -> List[int]:
+  """
+  Resolve the "standard target sizes" list with precedence:
+    1) project_cfg["target_sizes"]
+    2) app_cfg["default_target_sizes"]
+    3) STANDARD_TARGET_SIZES fallback
+  """
+  if isinstance(project_cfg, dict):
+    proj = _sanitize_target_sizes(project_cfg.get("target_sizes"))
+    if proj:
+      return proj
+
+  if isinstance(app_cfg, dict):
+    app = _sanitize_target_sizes(app_cfg.get("default_target_sizes"))
+    if app:
+      return app
+
+  return list(STANDARD_TARGET_SIZES)
+
+def resolve_max_target_size(project_cfg: Optional[dict], app_cfg: Optional[dict]) -> int:
+  """
+  Resolve the maximum allowed layer size based on the active target sizes list.
+
+  Rule
+  - Max allowed size is the highest number in the resolved target sizes.
+  - Because _sanitize_target_sizes() clamps to <= ICO_MAX_PNG_SIZE, this is always safe.
+
+  Returns
+  - int max size (>= 1). Falls back to ICO_MAX_PNG_SIZE if list is empty.
+  """
+  sizes = resolve_standard_target_sizes(project_cfg, app_cfg)
+  if not sizes:
+    return ICO_MAX_PNG_SIZE
+  return int(max(sizes))
 
 
 def gather_png_sources_with_dims(input_dir: str) -> List[Tuple[int, int, str]]:
@@ -466,7 +554,7 @@ def pick_largest_qualifying_source(
   return p
 
 
-def build_default_layers_from_sources(input_dir: str) -> List[LayerItem]:
+def build_default_layers_from_sources(input_dir: str, standard_sizes: List[int]) -> List[LayerItem]:
   """
   Create default layer rows (targets) based on what sources exist.
   - Includes standard targets up to the largest available dimension.
@@ -480,7 +568,7 @@ def build_default_layers_from_sources(input_dir: str) -> List[LayerItem]:
   # Use the largest "square-safe" dimension for deciding which targets to include
   max_square_dim = max(min(w, h) for (w, h, _p) in sources)
 
-  targets = [s for s in STANDARD_TARGET_SIZES if s <= max_square_dim]
+  targets = [s for s in standard_sizes if s <= max_square_dim]
   if not targets:
     # If nothing reaches 16x16, still create 16 as a target and fallback to largest source
     targets = [16]
@@ -500,7 +588,7 @@ def build_default_layers_from_sources(input_dir: str) -> List[LayerItem]:
 # Discovery / merge rules
 # =============================================================================
 
-def discover_layers_in_dir(input_dir: str) -> Dict[Tuple[int, int], str]:
+def discover_layers_in_dir(input_dir: str, *, max_size: int) -> Dict[Tuple[int, int], str]:
   """
   Discover PNG layers in input directory by parsing any 'WxH' size token.
 
@@ -522,12 +610,17 @@ def discover_layers_in_dir(input_dir: str) -> Dict[Tuple[int, int], str]:
     size = parse_size_token(name)
     if not size:
       continue
+
+    # Ignore discoveries larger than the active target sizes max.
+    w, h = size
+    if w > max_size or h > max_size:
+      continue
+
     full = os.path.join(input_dir, name)
     if not os.path.isfile(full):
       continue
     if size not in found:
       found[size] = normalize_relpath(input_dir, full)
-
   return found
 
 
@@ -648,11 +741,13 @@ def build_ico_from_layers(
       if tw <= 0 or th <= 0:
         raise ValueError(f"Invalid target size for layer: {tw}x{th}")
 
-      if tw > ICO_MAX_PNG_SIZE or th > ICO_MAX_PNG_SIZE:
+      cfg = load_config(input_dir)
+      max_size = resolve_max_target_size(cfg, None)
+
+      if tw > max_size or th > max_size:
         raise ValueError(
           f"Invalid ICO layer size {tw}x{th}. "
-          f"Max supported size is {ICO_MAX_PNG_SIZE}x{ICO_MAX_PNG_SIZE}. "
-          "Set the Target size to 256 or smaller."
+          f"Max allowed by Target Sizes is {max_size}x{max_size}."
         )
 
       with Image.open(full) as img:
@@ -721,15 +816,27 @@ class App(ctk.CTk):
     self.input_dir: str = ""
     self.layers: List[LayerItem] = []
 
-    # Recent input directories (stored beside this script, not in the input dir)
-    app_cfg = _read_json(APP_CONFIG_PATH)
+    # App-level config (stored beside this script, not in the input dir)
+    self.app_cfg = _read_json(APP_CONFIG_PATH)
+
+    # Ensure app-level default sizes exist (managed by the script)
+    if not _sanitize_target_sizes(self.app_cfg.get("default_target_sizes")):
+      self.app_cfg["default_target_sizes"] = list(STANDARD_TARGET_SIZES)
+      _write_json_atomic(APP_CONFIG_PATH, self.app_cfg)
+
+    # User-editable sizes UI vars
+    self.app_default_target_sizes: List[int] = _sanitize_target_sizes(self.app_cfg.get("default_target_sizes")) or list(STANDARD_TARGET_SIZES)
+    self.project_target_sizes: List[int] = []  # populated on project load (optional override)
+
+    self.target_sizes_var = tk.StringVar(value=_sizes_to_csv(self.app_default_target_sizes))
 
     # Support 16 previous dirs by default.
-    self.recent_input_dirs_max = int(app_cfg.get("recent_input_dirs_max", 16) or 16)
+    self.recent_input_dirs_max = int(self.app_cfg.get("recent_input_dirs_max", 16) or 16)
+
     if self.recent_input_dirs_max <= 0:
       self.recent_input_dirs_max = 16
 
-    raw = app_cfg.get("recent_input_dirs", [])
+    raw = self.app_cfg.get("recent_input_dirs", [])
     if not isinstance(raw, list):
       raw = []
 
@@ -760,20 +867,12 @@ class App(ctk.CTk):
     self._build_layers_editor()
     self._build_bottom_controls()
 
-    # Auto-load the most recent project (if any) on startup.
-    if self.recent_input_dirs:
-      try:
-        self.load_or_init_from_input_dir(self.recent_input_dirs[0])
-      except Exception as e:
-        logging.warning("Auto-load recent project failed: %s", e)
-
     # Auto-load most recent project (if any) on startup.
     try:
       if self.recent_input_dirs and os.path.isdir(self.recent_input_dirs[0]):
         self.load_or_init_from_input_dir(self.recent_input_dirs[0])
-    except Exception:
-      # Best-effort startup behavior; do not prevent app launch.
-      pass
+    except Exception as e:
+      logging.warning("Auto-load recent project failed: %s", e)
 
   # ---------------------------------------------------------------------------
   # UI construction
@@ -818,6 +917,45 @@ class App(ctk.CTk):
     # Keep the "clear history" functionality, just move it onto the top row.
     self.btn_clear_recent = ctk.CTkButton(self.top, text="Clear History", command=self.on_clear_recent, width=120)
     self.btn_clear_recent.grid(row=0, column=5, padx=8, pady=8)
+
+    # -------------------------------------------------------------------------
+    # Standard Target Sizes (App default + Project override)
+    # -------------------------------------------------------------------------
+
+    ctk.CTkLabel(self.top, text="Target Sizes:").grid(
+      row=1,
+      column=0,
+      sticky="w",
+      padx=8,
+      pady=(0, 8),
+    )
+
+    self.target_sizes_entry = ctk.CTkEntry(self.top, textvariable=self.target_sizes_var)
+    self.target_sizes_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=(0, 8))
+
+    self.btn_set_project_sizes = ctk.CTkButton(
+      self.top,
+      text="Use for Project",
+      command=self.on_set_project_target_sizes,
+      width=130,
+    )
+    self.btn_set_project_sizes.grid(row=1, column=2, padx=8, pady=(0, 8))
+
+    self.btn_set_app_sizes = ctk.CTkButton(
+      self.top,
+      text="Set App Default",
+      command=self.on_set_app_default_target_sizes,
+      width=140,
+    )
+    self.btn_set_app_sizes.grid(row=1, column=3, padx=8, pady=(0, 8))
+
+    self.btn_clear_project_sizes = ctk.CTkButton(
+      self.top,
+      text="Clear Project Override",
+      command=self.on_clear_project_target_sizes,
+      width=170,
+    )
+    self.btn_clear_project_sizes.grid(row=1, column=4, padx=8, pady=(0, 8), columnspan=2, sticky="w")
 
     self.top.grid_columnconfigure(1, weight=1)
 
@@ -867,17 +1005,28 @@ class App(ctk.CTk):
   # ---------------------------------------------------------------------------
 
   def make_config_dict(self) -> dict:
+    # Hard guarantee: config always stores layers in correct order.
+    self.layers = sort_layers_desc(self.layers)
+
     return {
       "version": 2,
       "input_dir": ".",  # implicit; config lives inside input_dir
+
+      # Optional override for "standard target sizes" on this project.
+      # If empty, project will inherit app default_target_sizes.
+      "target_sizes": list(self.project_target_sizes) if self.project_target_sizes else [],
+
       "output_dir": self.output_dir_var.get(),
       "output_name": self.output_name_var.get(),
-      "layers": layers_to_config(sort_layers_desc(self.layers)),
+      "layers": layers_to_config(self.layers),
     }
 
   def persist_config_if_possible(self) -> None:
     if not self.input_dir or not os.path.isdir(self.input_dir):
       return
+
+    # Hard guarantee: any config write keeps layers ordered largest→smallest.
+    self.layers = sort_layers_desc(self.layers)
     save_config(self.input_dir, self.make_config_dict())
 
   def load_or_init_from_input_dir(self, input_dir: str) -> None:
@@ -885,12 +1034,22 @@ class App(ctk.CTk):
     self.input_dir_var.set(self.input_dir)
 
     cfg = load_config(self.input_dir)
-    discovered = discover_layers_in_dir(self.input_dir)
 
     default_out_dir = self.input_dir
 
+    # Resolve sizes for this project (project override > app default > hardcoded)
+    standard_sizes = resolve_standard_target_sizes(cfg, self.app_cfg)
+
+    # Max allowed size is the highest number in the active target sizes list.
+    max_size = resolve_max_target_size(cfg, self.app_cfg)
+
+    discovered = discover_layers_in_dir(self.input_dir, max_size=max_size)
+
     if cfg:
-      cfg_layers = layers_from_config(cfg)
+      # Load optional project override sizes
+      self.project_target_sizes = _sanitize_target_sizes(cfg.get("target_sizes"))
+
+      cfg_layers = layers_from_config(cfg, max_size=max_size)
       merged = merge_config_layers_with_discovery(self.input_dir, cfg_layers, discovered)
 
       out_dir = cfg.get("output_dir")
@@ -919,8 +1078,11 @@ class App(ctk.CTk):
 
       self.layers = sort_layers_desc(merged)
     else:
-      # NEW: Default layer rows + auto-pick best source for each target.
-      self.layers = build_default_layers_from_sources(self.input_dir)
+      # New project => no project override yet
+      self.project_target_sizes = []
+
+      # NEW: Default layer rows + auto-pick best source for each target (uses resolved standard sizes).
+      self.layers = build_default_layers_from_sources(self.input_dir, standard_sizes)
 
       # Fallback: if no readable PNGs, keep old discovery behavior
       if not self.layers:
@@ -930,6 +1092,11 @@ class App(ctk.CTk):
         self.layers = sort_layers_desc(init_layers)
 
       self.output_dir_var.set(default_out_dir)
+
+    # Keep the Target Sizes entry synced:
+    # - show project override if set, else show the resolved list (app default/hardcoded)
+    shown = self.project_target_sizes if self.project_target_sizes else standard_sizes
+    self.target_sizes_var.set(_sizes_to_csv(shown))
 
     self.persist_config_if_possible()
     self.refresh_layer_rows()
@@ -956,11 +1123,15 @@ class App(ctk.CTk):
       if w <= 0 or h <= 0:
         return
 
-      if w > ICO_MAX_PNG_SIZE or h > ICO_MAX_PNG_SIZE:
+      # Max allowed size is the highest number in the active target sizes list.
+      cfg = load_config(self.input_dir) if (self.input_dir and os.path.isdir(self.input_dir)) else None
+      max_size = resolve_max_target_size(cfg, self.app_cfg)
+
+      if w > max_size or h > max_size:
         messagebox.showerror(
           APP_TITLE,
           f"Invalid ICO target size {w}x{h}.\n\n"
-          f"Max supported size is {ICO_MAX_PNG_SIZE}x{ICO_MAX_PNG_SIZE}."
+          f"Max allowed by Target Sizes is {max_size}x{max_size}."
         )
         return
 
@@ -1066,122 +1237,19 @@ class App(ctk.CTk):
 
   def _persist_app_config(self) -> None:
     """
-    Persist app-level config (recent dirs + max) beside this script.
+    Persist app-level config beside this script.
     """
     _write_json_atomic(APP_CONFIG_PATH, {
       "recent_input_dirs_max": int(self.recent_input_dirs_max),
       "recent_input_dirs": list(self.recent_input_dirs),
+      "default_target_sizes": list(self.app_default_target_sizes),
     })
-
-  def _update_recent_menu(self) -> None:
-    """
-    Refresh the option menu values to match self.recent_input_dirs.
-    """
-    values = self.recent_input_dirs if self.recent_input_dirs else ["(none)"]
-    try:
-      self.recent_menu.configure(values=values)
-    except Exception:
-      pass
-
-    # If current selection is invalid, force a safe value
-    cur = str(self.recent_input_dir_var.get() or "").strip()
-    if not cur or cur not in values:
-      self.recent_input_dir_var.set(values[0])
-
-  def _remember_input_dir(self, p: str) -> None:
-    """
-    Add directory to recent list (front), dedupe, trim to max, persist + refresh UI.
-    """
-    if not p:
-      return
-
-    p_norm = _norm_dir(p)
-    if not os.path.isdir(p_norm):
-      return
-
-    # Move to front
-    items = [p_norm] + [x for x in self.recent_input_dirs if x != p_norm]
-    items = _dedupe_keep_order(items)
-    items = _filter_existing_dirs(items)
-    items = items[: self.recent_input_dirs_max]
-
-    self.recent_input_dirs = items
-
-    # Avoid triggering on_recent_selected while we programmatically set it
-    self._loading_recent_select = True
-    try:
-      self.recent_input_dir_var.set(p_norm)
-      self._update_recent_menu()
-    finally:
-      self._loading_recent_select = False
-
-    self._persist_app_config()
-
-  def _apply_recent_max_from_entry(self) -> None:
-    """
-    Parse/validate 'Keep last' entry, update max + trim list + persist + refresh menu.
-    """
-    raw = str(self.recent_max_var.get() or "").strip()
-    try:
-      n = int(raw)
-    except Exception:
-      n = self.recent_input_dirs_max
-
-    # Clamp to sane bounds
-    if n <= 0:
-      n = 1
-    if n > 200:
-      n = 200
-
-    self.recent_input_dirs_max = n
-    self.recent_max_var.set(str(n))
-
-    # Trim list to new max
-    self.recent_input_dirs = self.recent_input_dirs[: self.recent_input_dirs_max]
-    self._update_recent_menu()
-    self._persist_app_config()
-
-  def on_recent_selected(self, choice: str) -> None:
-    """
-    OptionMenu callback: selecting a recent dir loads it.
-    """
-    if self._loading_recent_select:
-      return
-
-    p = str(choice or "").strip()
-    if not p or p == "(none)":
-      return
-
-    if not os.path.isdir(p):
-      # Remove dead entry and refresh
-      self.recent_input_dirs = [x for x in self.recent_input_dirs if x != p]
-      self._update_recent_menu()
-      self._persist_app_config()
-      messagebox.showerror(APP_TITLE, f"Recent directory no longer exists:\n\n{p}")
-      return
-
-    self.input_dir_var.set(p)
-    self._remember_input_dir(p)
-    self.load_or_init_from_input_dir(p)
-
-  def on_clear_recent(self) -> None:
-    """
-    Clear recent dir history.
-    """
-    self.recent_input_dirs = []
-    self._loading_recent_select = True
-    try:
-      self.recent_input_dir_var.set("(none)")
-      self._update_recent_menu()
-    finally:
-      self._loading_recent_select = False
-
-    self._persist_app_config()
 
   def _persist_recent_input_dirs(self) -> None:
     _write_json_atomic(APP_CONFIG_PATH, {
       "recent_input_dirs_max": int(self.recent_input_dirs_max),
       "recent_input_dirs": list(self.recent_input_dirs),
+      "default_target_sizes": list(self.app_default_target_sizes),
     })
 
   def _refresh_input_dir_dropdown(self) -> None:
@@ -1214,6 +1282,57 @@ class App(ctk.CTk):
     self._persist_recent_input_dirs()
     self._refresh_input_dir_dropdown()
 
+  def on_set_project_target_sizes(self) -> None:
+    """
+    Save Target Sizes as a per-project override (png_to_ico.json -> target_sizes).
+    """
+    if not self.input_dir or not os.path.isdir(self.input_dir):
+      messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
+      return
+
+    sizes = _csv_to_sizes(self.target_sizes_var.get())
+    if not sizes:
+      messagebox.showerror(
+        APP_TITLE,
+        "Target sizes are empty or invalid.\n\nExample:\n  256,128,64,48,32,24,16"
+      )
+      return
+
+    self.project_target_sizes = sizes
+    self.persist_config_if_possible()
+    messagebox.showinfo(APP_TITLE, "Saved target sizes for this project.")
+
+  def on_set_app_default_target_sizes(self) -> None:
+    """
+    Save Target Sizes as the app default (config.json -> default_target_sizes).
+    """
+    sizes = _csv_to_sizes(self.target_sizes_var.get())
+    if not sizes:
+      messagebox.showerror(
+        APP_TITLE,
+        "Target sizes are empty or invalid.\n\nExample:\n  256,128,64,48,32,24,16"
+      )
+      return
+
+    self.app_default_target_sizes = sizes
+    self.app_cfg["default_target_sizes"] = list(self.app_default_target_sizes)
+    self._persist_app_config()
+    messagebox.showinfo(APP_TITLE, "Saved app default target sizes.")
+
+  def on_clear_project_target_sizes(self) -> None:
+    """
+    Clear the per-project override so this project inherits the app default sizes.
+    """
+    if not self.input_dir or not os.path.isdir(self.input_dir):
+      messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
+      return
+
+    self.project_target_sizes = []
+    self.target_sizes_var.set(_sizes_to_csv(self.app_default_target_sizes))
+
+    self.persist_config_if_possible()
+    messagebox.showinfo(APP_TITLE, "Cleared project override; using app default target sizes.")
+
   def on_browse_input_dir(self) -> None:
     cur = str(self.input_dir_var.get() or "").strip()
     initialdir = cur if (cur and os.path.isdir(cur)) else (self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd()))
@@ -1237,7 +1356,10 @@ class App(ctk.CTk):
       messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
       return
 
-    discovered = discover_layers_in_dir(self.input_dir)
+    cfg = load_config(self.input_dir)
+    max_size = resolve_max_target_size(cfg, self.app_cfg)
+
+    discovered = discover_layers_in_dir(self.input_dir, max_size=max_size)
     cfg_layers = self.layers[:]  # current state is the "config" state
     merged = merge_config_layers_with_discovery(self.input_dir, cfg_layers, discovered)
     self.layers = sort_layers_desc(merged)
@@ -1287,9 +1409,13 @@ class App(ctk.CTk):
       return
 
     w0, h0 = size
-    if w0 > ICO_MAX_PNG_SIZE or h0 > ICO_MAX_PNG_SIZE:
-      # Default to a sane ICO target instead of inheriting a too-large source dimension.
-      size = (ICO_MAX_PNG_SIZE, ICO_MAX_PNG_SIZE)
+
+    cfg = load_config(self.input_dir)
+    max_size = resolve_max_target_size(cfg, self.app_cfg)
+
+    if w0 > max_size or h0 > max_size:
+      # Default to the largest allowed target size instead of inheriting a too-large source dimension.
+      size = (max_size, max_size)
 
     self.layers.append(LayerItem(target_size=size, source_rel_path=rel_path, enabled=True))
 
@@ -1376,12 +1502,16 @@ class App(ctk.CTk):
       return
 
     try:
+      # Hard guarantee: runtime state also stays ordered.
+      self.layers = sort_layers_desc(self.layers)
+
       ico_path = build_ico_from_layers(
         input_dir=self.input_dir,
         layers=self.layers,
         output_dir=out_dir,
         output_name=out_name,
       )
+
       self.persist_config_if_possible()
       messagebox.showinfo(APP_TITLE, f"ICO created:\n{ico_path}")
     except Exception as e:
