@@ -26,7 +26,7 @@ On Linux or macOS, activate the virtual environment with `source .venv/bin/activ
 ## Run
 
 ```bash
-python png_to_ico.py
+python png-to-ico.py
 ```
 
 ## Input Convention

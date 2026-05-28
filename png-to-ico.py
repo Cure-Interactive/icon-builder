@@ -17,11 +17,11 @@ Layer rules
 - At build time, each enabled layer is resized to its configured target size (if needed).
 
 Config behavior
-- A `png_to_ico.json` is stored INSIDE the selected input directory.
+- A `png-to-ico.json` is stored INSIDE the selected input directory.
 - When an input directory is selected:
-  - If `png_to_ico.json` exists, it is loaded and used to populate UI + selections.
-  - If missing, the UI is populated from discovered layers and written to `png_to_ico.json`.
-- The program keeps `png_to_ico.json` updated whenever:
+  - If `png-to-ico.json` exists, it is loaded and used to populate UI + selections.
+  - If missing, the UI is populated from discovered layers and written to `png-to-ico.json`.
+- The program keeps `png-to-ico.json` updated whenever:
   - layer list changes
   - enabled state changes
   - file path changes
@@ -95,7 +95,7 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 
 APP_TITLE = "PNG to ICO - Cure Interactive"
 APP_USER_MODEL_ID = "CureInteractive.PNGToICO"
-CONFIG_FILENAME = "png_to_ico.json"
+CONFIG_FILENAME = "png-to-ico.json"
 APP_CONFIG_FILENAME = "config.json"
 APP_CONFIG_PATH = os.path.join(SCRIPT_ROOT_DIR, APP_CONFIG_FILENAME)
 
@@ -245,6 +245,19 @@ def normalize_relpath(input_dir: str, path: str) -> str:
     return path_abs
 
 
+def normalize_dirpath(input_dir: str, path: str) -> str:
+  """
+  Convert a directory path to a config-safe relative path when possible.
+
+  "." is used for the selected input directory itself. Paths outside input_dir
+  stay absolute.
+  """
+  normalized = normalize_relpath(input_dir, path)
+  if normalized in ("", "."):
+    return "."
+  return normalized
+
+
 def resolve_path(input_dir: str, rel_or_abs: str) -> str:
   """
   Resolve a config-stored path to an absolute path.
@@ -261,16 +274,26 @@ def resolve_path(input_dir: str, rel_or_abs: str) -> str:
   return os.path.abspath(os.path.join(os.path.abspath(input_dir), rel_or_abs))
 
 
+def resolve_output_dir(input_dir: str, rel_or_abs: str) -> str:
+  """
+  Resolve a config-stored output directory to an absolute path.
+
+  Relative output directories are interpreted relative to input_dir, which is
+  the selected project directory containing png-to-ico.json.
+  """
+  return resolve_path(input_dir, rel_or_abs)
+
+
 def config_path_for_input_dir(input_dir: str) -> str:
   """
-  Get png_to_ico.json full path inside input directory.
+  Get png-to-ico.json full path inside input directory.
   """
   return os.path.join(os.path.abspath(input_dir), CONFIG_FILENAME)
 
 
 def load_config(input_dir: str) -> Optional[dict]:
   """
-  Load png_to_ico.json from input directory, if it exists.
+  Load png-to-ico.json from input directory, if it exists.
 
   Returns
   - dict if loaded; otherwise None.
@@ -288,7 +311,7 @@ def load_config(input_dir: str) -> Optional[dict]:
 
 def save_config(input_dir: str, data: dict) -> None:
   """
-  Save png_to_ico.json in the input directory.
+  Save png-to-ico.json in the input directory.
   Intended to be called often to "keep config updated".
   """
   p = config_path_for_input_dir(input_dir)
@@ -349,7 +372,7 @@ def _filter_existing_dirs(items: List[str]) -> List[str]:
 
 def layers_to_config(layers: List[LayerItem]) -> List[dict]:
   """
-  Serialize layer items for png_to_ico.json.
+  Serialize layer items for png-to-ico.json.
   """
   out: List[dict] = []
   for it in layers:
@@ -367,7 +390,7 @@ def layers_to_config(layers: List[LayerItem]) -> List[dict]:
 
 def layers_from_config(data: dict, *, max_size: int) -> List[LayerItem]:
   """
-  Deserialize layer items from png_to_ico.json structure.
+  Deserialize layer items from png-to-ico.json structure.
 
   Accepts:
   - "target_size" (preferred) or "size" (legacy)
@@ -707,7 +730,7 @@ def build_ico_from_layers(
   if not output_name.lower().endswith(".ico"):
     output_name += ".ico"
 
-  out_dir_abs = os.path.abspath(output_dir)
+  out_dir_abs = resolve_output_dir(input_dir, output_dir)
   os.makedirs(out_dir_abs, exist_ok=True)
   ico_path = os.path.abspath(os.path.join(out_dir_abs, output_name))
 
@@ -785,7 +808,7 @@ class App(ctk.CTk):
   CustomTkinter application for managing layers and building ICO files.
 
   UI features
-  - Select input directory (contains png_to_ico.json, may contain discovered layers).
+  - Select input directory (contains png-to-ico.json, may contain discovered layers).
   - Rescan layers (auto-discovery from filenames containing WxH).
   - Per-layer controls:
     - Enable/disable
@@ -1016,7 +1039,7 @@ class App(ctk.CTk):
       # If empty, project will inherit app default_target_sizes.
       "target_sizes": list(self.project_target_sizes) if self.project_target_sizes else [],
 
-      "output_dir": self.output_dir_var.get(),
+      "output_dir": normalize_dirpath(self.input_dir, self.output_dir_var.get()),
       "output_name": self.output_name_var.get(),
       "layers": layers_to_config(self.layers),
     }
@@ -1035,7 +1058,7 @@ class App(ctk.CTk):
 
     cfg = load_config(self.input_dir)
 
-    default_out_dir = self.input_dir
+    default_out_dir = "."
 
     # Resolve sizes for this project (project override > app default > hardcoded)
     standard_sizes = resolve_standard_target_sizes(cfg, self.app_cfg)
@@ -1059,9 +1082,10 @@ class App(ctk.CTk):
       # - alert the user
       # - after OK, reset output to the selected project directory
       if isinstance(out_dir, str) and out_dir.strip():
-        out_dir_abs = os.path.abspath(out_dir.strip())
+        out_dir_text = out_dir.strip()
+        out_dir_abs = resolve_output_dir(self.input_dir, out_dir_text)
         if os.path.isdir(out_dir_abs):
-          self.output_dir_var.set(out_dir_abs)
+          self.output_dir_var.set(out_dir_text)
         else:
           messagebox.showwarning(
             APP_TITLE,
@@ -1284,7 +1308,7 @@ class App(ctk.CTk):
 
   def on_set_project_target_sizes(self) -> None:
     """
-    Save Target Sizes as a per-project override (png_to_ico.json -> target_sizes).
+    Save Target Sizes as a per-project override (png-to-ico.json -> target_sizes).
     """
     if not self.input_dir or not os.path.isdir(self.input_dir):
       messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
@@ -1336,7 +1360,7 @@ class App(ctk.CTk):
   def on_browse_input_dir(self) -> None:
     cur = str(self.input_dir_var.get() or "").strip()
     initialdir = cur if (cur and os.path.isdir(cur)) else (self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd()))
-    p = filedialog.askdirectory(title="Select input directory (contains png_to_ico.json)", initialdir=initialdir)
+    p = filedialog.askdirectory(title="Select input directory (contains png-to-ico.json)", initialdir=initialdir)
     if not p:
       return
     self.input_dir_var.set(os.path.abspath(p))
@@ -1369,11 +1393,13 @@ class App(ctk.CTk):
 
   def on_browse_output_dir(self) -> None:
     cur = str(self.output_dir_var.get() or "").strip()
-    initialdir = cur if (cur and os.path.isdir(cur)) else (self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd()))
+    initialdir = resolve_output_dir(self.input_dir, cur) if (self.input_dir and cur) else cur
+    if not initialdir or not os.path.isdir(initialdir):
+      initialdir = self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd())
     p = filedialog.askdirectory(title="Select output directory", initialdir=initialdir)
     if not p:
       return
-    self.output_dir_var.set(os.path.abspath(p))
+    self.output_dir_var.set(normalize_dirpath(self.input_dir, p) if self.input_dir else os.path.abspath(p))
 
   def on_add_layer(self) -> None:
     """

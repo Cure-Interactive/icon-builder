@@ -6,7 +6,7 @@ PNG To ICO builds a Windows `.ico` file from PNG layers.
 
 ```bash
 python setup.py --venv
-python png_to_ico.py
+python png-to-ico.py
 ```
 
 Manual install:
@@ -15,7 +15,7 @@ Manual install:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python png_to_ico.py
+python png-to-ico.py
 ```
 
 On Linux or macOS, use `source .venv/bin/activate`.
@@ -35,11 +35,11 @@ Layers are ordered largest to smallest in the generated `.ico`.
 
 ## Project State
 
-The app can save layer configuration into `config.json` inside the selected input directory. App-level recent-folder settings are stored in `config.json` beside `png_to_ico.py`. Runtime config is ignored by Git.
+The app can save layer configuration into `config.json` inside the selected input directory. App-level recent-folder settings are stored in `config.json` beside `png-to-ico.py`. Runtime config is ignored by Git.
 
 ## Common Workflow
 
-1. Start `png_to_ico.py`.
+1. Start `png-to-ico.py`.
 2. Select the input directory containing PNG layers.
 3. Review discovered layers.
 4. Add, remove, disable, or reorder layers if needed.
