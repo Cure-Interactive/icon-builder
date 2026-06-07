@@ -2,26 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-png_to_ico_gui.py
+icon_builder.py
 
 Purpose
-- Native GUI (CustomTkinter) for building a multi-layer Windows .ICO from PNG layers.
+- Native GUI (CustomTkinter) for building a multi-layer Windows .ICO from image layers.
 - Layers can come from:
   1) Automatic discovery in the selected input directory (regex WxH size token), and/or
   2) Manual user configuration in the UI:
-     - choose any PNG file for a layer
+     - choose any PNG or SVG file for a layer
      - set/override that layer's target size (W,H)
 
 Layer rules
-- Layers are always ordered largest → smallest (by target pixel area, then width/height).
-- At build time, each enabled layer is resized to its configured target size (if needed).
+- Layers are always ordered largest to smallest (by target pixel area, then width/height).
+- At build time, each enabled layer is rendered to its configured target size.
 
 Config behavior
-- A `png-to-ico.json` is stored INSIDE the selected input directory.
+- An `icon-builder.json` is stored INSIDE the selected input directory.
 - When an input directory is selected:
-  - If `png-to-ico.json` exists, it is loaded and used to populate UI + selections.
-  - If missing, the UI is populated from discovered layers and written to `png-to-ico.json`.
-- The program keeps `png-to-ico.json` updated whenever:
+  - If `icon-builder.json` exists, it is loaded and used to populate UI + selections.
+  - If missing, the legacy `png-to-ico.json` is loaded when present.
+  - If both are missing, the UI is populated from discovered layers and written to `icon-builder.json`.
+- The program keeps `icon-builder.json` updated whenever:
   - layer list changes
   - enabled state changes
   - file path changes
@@ -29,10 +30,10 @@ Config behavior
   - output settings change
 
 Dependencies
-- pip install pillow icoutil customtkinter
+- pip install pillow icoutil customtkinter resvg-py
 
 Notes
-- Auto-discovery still uses filenames containing a "{W}x{H}" token, e.g., "icon_32x32.png".
+- Auto-discovery uses filenames containing a "{W}x{H}" token, e.g., "icon_32x32.svg".
 - Manual per-layer file selection does NOT require a size token; target size is editable in UI.
 - Paths in config are stored as relative to input directory when possible.
 """
@@ -45,12 +46,14 @@ import os
 import re
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 import icoutil
+import resvg_py
 
 try:
   import customtkinter as ctk
@@ -68,13 +71,13 @@ from tkinter import filedialog, messagebox
 
 from datetime import datetime
 
-# Log files go to: <script_root>/_logs/png_to_ico_YYYY-MM-DD_HH-MM-SS.log
+# Log files go to: <script_root>/_logs/icon_builder_YYYY-MM-DD_HH-MM-SS.log
 SCRIPT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(SCRIPT_ROOT_DIR, "_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 LOG_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-LOG_FILENAME = f"png_to_ico_{LOG_TS}.log"
+LOG_FILENAME = f"icon_builder_{LOG_TS}.log"
 LOG_PATH = os.path.join(LOG_DIR, LOG_FILENAME)
 
 logging.basicConfig(
@@ -93,11 +96,19 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # Constants / Regex
 # =============================================================================
 
-APP_TITLE = "PNG to ICO - Cure Interactive"
-APP_USER_MODEL_ID = "CureInteractive.PNGToICO"
-CONFIG_FILENAME = "png-to-ico.json"
+APP_TITLE = "Icon Builder - Cure Interactive"
+APP_USER_MODEL_ID = "CureInteractive.IconBuilder"
+CONFIG_FILENAME = "icon-builder.json"
+LEGACY_CONFIG_FILENAME = "png-to-ico.json"
 APP_CONFIG_FILENAME = "config.json"
 APP_CONFIG_PATH = os.path.join(SCRIPT_ROOT_DIR, APP_CONFIG_FILENAME)
+SUPPORTED_SOURCE_EXTS = (".png", ".svg")
+SOURCE_FILETYPES = [
+  ("Supported images", "*.png *.svg"),
+  ("PNG images", "*.png"),
+  ("SVG images", "*.svg"),
+  ("All files", "*.*"),
+]
 
 # Match "000x000" style tokens anywhere in filename (1-4 digits each).
 SIZE_TOKEN_RE = re.compile(r"(?P<w>\d{1,4})x(?P<h>\d{1,4})", re.IGNORECASE)
@@ -185,7 +196,7 @@ class LayerItem:
 
   def size_key_desc(self) -> Tuple[int, int, int]:
     """
-    Sort key for largest→smallest:
+    Sort key for largest to smallest:
       - area desc
       - width desc
       - height desc
@@ -279,31 +290,45 @@ def resolve_output_dir(input_dir: str, rel_or_abs: str) -> str:
   Resolve a config-stored output directory to an absolute path.
 
   Relative output directories are interpreted relative to input_dir, which is
-  the selected project directory containing png-to-ico.json.
+  the selected project directory containing icon-builder.json.
   """
   return resolve_path(input_dir, rel_or_abs)
 
 
 def config_path_for_input_dir(input_dir: str) -> str:
   """
-  Get png-to-ico.json full path inside input directory.
+  Get icon-builder.json full path inside input directory.
   """
   return os.path.join(os.path.abspath(input_dir), CONFIG_FILENAME)
 
 
+def legacy_config_path_for_input_dir(input_dir: str) -> str:
+  """
+  Get legacy png-to-ico.json full path inside input directory.
+  """
+  return os.path.join(os.path.abspath(input_dir), LEGACY_CONFIG_FILENAME)
+
+
 def load_config(input_dir: str) -> Optional[dict]:
   """
-  Load png-to-ico.json from input directory, if it exists.
+  Load icon-builder.json from input directory, falling back to legacy png-to-ico.json.
 
   Returns
   - dict if loaded; otherwise None.
   """
   p = config_path_for_input_dir(input_dir)
+  loaded_from_legacy = False
+  if not os.path.isfile(p):
+    p = legacy_config_path_for_input_dir(input_dir)
+    loaded_from_legacy = True
   if not os.path.isfile(p):
     return None
   try:
     with open(p, "r", encoding="utf-8") as f:
-      return json.load(f)
+      data = json.load(f)
+    if isinstance(data, dict) and loaded_from_legacy:
+      data["_loaded_from_legacy_config"] = True
+    return data
   except Exception as e:
     logging.warning("Failed to load config: %s (%s)", p, e)
     return None
@@ -311,7 +336,7 @@ def load_config(input_dir: str) -> Optional[dict]:
 
 def save_config(input_dir: str, data: dict) -> None:
   """
-  Save png-to-ico.json in the input directory.
+  Save icon-builder.json in the input directory.
   Intended to be called often to "keep config updated".
   """
   p = config_path_for_input_dir(input_dir)
@@ -372,7 +397,7 @@ def _filter_existing_dirs(items: List[str]) -> List[str]:
 
 def layers_to_config(layers: List[LayerItem]) -> List[dict]:
   """
-  Serialize layer items for png-to-ico.json.
+  Serialize layer items for icon-builder.json.
   """
   out: List[dict] = []
   for it in layers:
@@ -390,7 +415,7 @@ def layers_to_config(layers: List[LayerItem]) -> List[dict]:
 
 def layers_from_config(data: dict, *, max_size: int) -> List[LayerItem]:
   """
-  Deserialize layer items from png-to-ico.json structure.
+  Deserialize layer items from icon-builder.json structure.
 
   Accepts:
   - "target_size" (preferred) or "size" (legacy)
@@ -428,7 +453,7 @@ def layers_from_config(data: dict, *, max_size: int) -> List[LayerItem]:
 
 
 # =============================================================================
-# Default target sizes (largest → smallest)
+# Default target sizes (largest to smallest)
 # =============================================================================
 
 # Windows ICO standard max size is 256x256 for widest compatibility.
@@ -445,7 +470,7 @@ def _sanitize_target_sizes(values) -> List[int]:
   - list[int|str] only (anything else => ignored)
   - clamp to 1..ICO_MAX_PNG_SIZE
   - de-dupe
-  - sort descending (largest → smallest)
+  - sort descending (largest to smallest)
   """
   if not isinstance(values, list):
     return []
@@ -484,6 +509,19 @@ def _csv_to_sizes(text: str) -> List[int]:
   return _sanitize_target_sizes(parts)
 
 
+def parse_square_size_token(value: str, fallback: int = 256) -> int:
+  size = parse_size_token(str(value or ""))
+  if size:
+    w, h = size
+    return max(1, min(ICO_MAX_PNG_SIZE, int(max(w, h))))
+
+  try:
+    n = int(str(value or "").strip())
+    return max(1, min(ICO_MAX_PNG_SIZE, n))
+  except Exception:
+    return fallback
+
+
 def resolve_standard_target_sizes(project_cfg: Optional[dict], app_cfg: Optional[dict]) -> List[int]:
   """
   Resolve the "standard target sizes" list with precedence:
@@ -520,9 +558,168 @@ def resolve_max_target_size(project_cfg: Optional[dict], app_cfg: Optional[dict]
   return int(max(sizes))
 
 
-def gather_png_sources_with_dims(input_dir: str) -> List[Tuple[int, int, str]]:
+def is_supported_source_path(path: str) -> bool:
+  return os.path.splitext(path)[1].lower() in SUPPORTED_SOURCE_EXTS
+
+
+def _parse_svg_length(value: str) -> Optional[float]:
   """
-  Collect candidate PNG sources in the input dir with actual dimensions.
+  Parse simple SVG length values such as "256", "256px", or "12.5pt".
+
+  This is only used for initial layer-size hints. Rendering itself is handled by resvg.
+  """
+  if not isinstance(value, str):
+    return None
+  m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)", value)
+  if not m:
+    return None
+  try:
+    n = float(m.group(1))
+    return n if n > 0 else None
+  except Exception:
+    return None
+
+
+def infer_svg_size(path: str) -> Optional[Tuple[int, int]]:
+  """
+  Read SVG width/height from root attributes or viewBox.
+
+  Returns
+  - (W,H) or None if unreadable.
+  """
+  try:
+    root = ET.parse(path).getroot()
+  except Exception:
+    return None
+
+  w = _parse_svg_length(root.attrib.get("width", ""))
+  h = _parse_svg_length(root.attrib.get("height", ""))
+  if w and h:
+    return (max(1, int(round(w))), max(1, int(round(h))))
+
+  view_box = root.attrib.get("viewBox") or root.attrib.get("viewbox") or ""
+  parts = re.split(r"[\s,]+", view_box.strip())
+  if len(parts) == 4:
+    try:
+      vb_w = float(parts[2])
+      vb_h = float(parts[3])
+      if vb_w > 0 and vb_h > 0:
+        return (max(1, int(round(vb_w))), max(1, int(round(vb_h))))
+    except Exception:
+      return None
+
+  return None
+
+
+def infer_raster_size(path: str) -> Optional[Tuple[int, int]]:
+  """
+  Read raster image dimensions from disk.
+
+  Returns
+  - (W,H) or None if unreadable.
+  """
+  try:
+    with Image.open(path) as img:
+      w, h = img.size
+      if w > 0 and h > 0:
+        return (int(w), int(h))
+  except Exception:
+    return None
+  return None
+
+
+def infer_source_size(path: str) -> Optional[Tuple[int, int]]:
+  ext = os.path.splitext(path)[1].lower()
+  if ext == ".svg":
+    return infer_svg_size(path)
+  return infer_raster_size(path)
+
+
+def render_raster_to_png(source_path: str, output_png: str, target_size: Tuple[int, int]) -> None:
+  tw, th = target_size
+  with Image.open(source_path) as img:
+    img = img.convert("RGBA")
+    if img.size != (tw, th):
+      img = img.resize((tw, th), resample=Image.LANCZOS)
+    img.save(output_png, format="PNG", optimize=True)
+
+
+def render_svg_to_png(source_path: str, output_png: str, target_size: Tuple[int, int]) -> None:
+  tw, th = target_size
+  try:
+    png_bytes = resvg_py.svg_to_bytes(
+      svg_path=source_path,
+      width=int(tw),
+      height=int(th),
+    )
+  except ValueError as e:
+    if "invalid size" not in str(e).lower():
+      raise
+    svg_text = normalize_svg_root_size_for_render(source_path, int(tw), int(th))
+    png_bytes = resvg_py.svg_to_bytes(
+      svg_string=svg_text,
+      width=int(tw),
+      height=int(th),
+    )
+  with open(output_png, "wb") as f:
+    f.write(bytes(png_bytes))
+
+
+def normalize_svg_root_size_for_render(source_path: str, width: int, height: int) -> str:
+  """
+  Return SVG text with pixel width/height on the root element.
+
+  Some renderers reject physical units such as mm for intrinsic SVG size. This
+  preserves the original source file and only normalizes the in-memory render input.
+  """
+  text = open(source_path, "r", encoding="utf-8").read()
+  root_match = re.search(r"<svg\b[^>]*>", text, flags=re.IGNORECASE | re.DOTALL)
+  if not root_match:
+    return text
+
+  root_tag = root_match.group(0)
+  fixed = re.sub(r"\swidth\s*=\s*(['\"]).*?\1", "", root_tag, flags=re.IGNORECASE | re.DOTALL)
+  fixed = re.sub(r"\sheight\s*=\s*(['\"]).*?\1", "", fixed, flags=re.IGNORECASE | re.DOTALL)
+  if fixed.endswith("/>"):
+    fixed = fixed[:-2] + f' width="{width}" height="{height}" />'
+  else:
+    fixed = fixed[:-1] + f' width="{width}" height="{height}">'
+  return text[:root_match.start()] + fixed + text[root_match.end():]
+
+
+def render_source_to_png(source_path: str, output_png: str, target_size: Tuple[int, int]) -> None:
+  ext = os.path.splitext(source_path)[1].lower()
+  if ext == ".svg":
+    render_svg_to_png(source_path, output_png, target_size)
+    return
+  render_raster_to_png(source_path, output_png, target_size)
+
+
+def validate_source_file(path: str) -> Optional[str]:
+  ext = os.path.splitext(path)[1].lower()
+  if ext not in SUPPORTED_SOURCE_EXTS:
+    return "unsupported image type"
+
+  if ext == ".svg":
+    if infer_svg_size(path):
+      return None
+    try:
+      ET.parse(path)
+      return None
+    except Exception:
+      return "invalid SVG"
+
+  try:
+    with Image.open(path) as img:
+      img.verify()
+    return None
+  except Exception:
+    return "invalid raster image"
+
+
+def gather_image_sources_with_dims(input_dir: str) -> List[Tuple[int, int, str]]:
+  """
+  Collect candidate image sources in the input dir with dimensions.
 
   Returns
   - list of (w, h, rel_path)
@@ -532,7 +729,7 @@ def gather_png_sources_with_dims(input_dir: str) -> List[Tuple[int, int, str]]:
     return out
 
   for name in os.listdir(input_dir):
-    if not name.lower().endswith(".png"):
+    if not is_supported_source_path(name):
       continue
 
     full = os.path.join(input_dir, name)
@@ -542,7 +739,7 @@ def gather_png_sources_with_dims(input_dir: str) -> List[Tuple[int, int, str]]:
     # Prefer filename token, else read actual size
     size = parse_size_token(name)
     if not size:
-      size = infer_png_size(full)
+      size = infer_source_size(full)
     if not size:
       continue
 
@@ -584,7 +781,7 @@ def build_default_layers_from_sources(input_dir: str, standard_sizes: List[int])
   - Always returns at least [16,32,48,64,128] if possible, and 256 if available.
   - Each row gets auto-assigned a best source file.
   """
-  sources = gather_png_sources_with_dims(input_dir)
+  sources = gather_image_sources_with_dims(input_dir)
   if not sources:
     return []
 
@@ -613,7 +810,7 @@ def build_default_layers_from_sources(input_dir: str, standard_sizes: List[int])
 
 def discover_layers_in_dir(input_dir: str, *, max_size: int) -> Dict[Tuple[int, int], str]:
   """
-  Discover PNG layers in input directory by parsing any 'WxH' size token.
+  Discover image layers in input directory by parsing any 'WxH' size token.
 
   Returns
   - dict[(W,H)] = relative path (preferred) or absolute if needed.
@@ -628,7 +825,7 @@ def discover_layers_in_dir(input_dir: str, *, max_size: int) -> Dict[Tuple[int, 
     return found
 
   for name in os.listdir(input_dir):
-    if not name.lower().endswith(".png"):
+    if not is_supported_source_path(name):
       continue
     size = parse_size_token(name)
     if not size:
@@ -682,28 +879,36 @@ def merge_config_layers_with_discovery(
   return out
 
 
+def repair_missing_layer_sources_from_available_sources(
+  input_dir: str,
+  layers: List[LayerItem],
+) -> List[LayerItem]:
+  """
+  Replace missing layer source paths with the best available source image.
+
+  This is intended for legacy config migration. Existing files are preserved.
+  """
+  sources = gather_image_sources_with_dims(input_dir)
+  if not sources:
+    return layers
+
+  for it in layers:
+    full = resolve_path(input_dir, it.source_rel_path)
+    if os.path.isfile(full):
+      continue
+
+    best = pick_largest_qualifying_source(it.target_size, sources)
+    if best:
+      it.source_rel_path = best
+
+  return layers
+
+
 def sort_layers_desc(layers: List[LayerItem]) -> List[LayerItem]:
   """
-  Always order largest → smallest (by target size).
+  Always order largest to smallest (by target size).
   """
   return sorted(layers, key=lambda it: it.size_key_desc(), reverse=True)
-
-
-def infer_png_size(path: str) -> Optional[Tuple[int, int]]:
-  """
-  Read PNG dimensions from disk.
-
-  Returns
-  - (W,H) or None if unreadable.
-  """
-  try:
-    with Image.open(path) as img:
-      w, h = img.size
-      if w > 0 and h > 0:
-        return (int(w), int(h))
-  except Exception:
-    return None
-  return None
 
 
 # =============================================================================
@@ -720,9 +925,9 @@ def build_ico_from_layers(
   Build an .ICO from enabled layers in the list.
 
   Behavior
-  - Layers are added in largest → smallest order (by target size).
+  - Layers are added in largest to smallest order (by target size).
   - Only enabled layers with existing source files are included.
-  - Each layer image is resized to its target size (if needed) before adding to the ICO.
+  - Each layer image is rendered to its target size before adding to the ICO.
 
   Returns
   - absolute path to the created ICO
@@ -739,11 +944,11 @@ def build_ico_from_layers(
   usable: List[Tuple[LayerItem, str]] = []
   for it in enabled:
     full = resolve_path(input_dir, it.source_rel_path)
-    if os.path.isfile(full):
+    if os.path.isfile(full) and is_supported_source_path(full):
       usable.append((it, full))
 
   if not usable:
-    raise ValueError("No enabled layer PNGs exist on disk. Fix paths or add layers.")
+    raise ValueError("No enabled layer source images exist on disk. Fix paths or add layers.")
 
   # If duplicate target sizes exist enabled, keep first (largest-first order still).
   seen_sizes: set = set()
@@ -756,7 +961,7 @@ def build_ico_from_layers(
 
   ico = icoutil.IcoFile()
 
-  # Temp files for resized PNGs, so icoutil can ingest them by path.
+  # Temp files for rendered PNGs, so icoutil can ingest them by path.
   temp_paths: List[str] = []
   try:
     for it, full in unique:
@@ -773,17 +978,11 @@ def build_ico_from_layers(
           f"Max allowed by Target Sizes is {max_size}x{max_size}."
         )
 
-      with Image.open(full) as img:
-        img = img.convert("RGBA")
-        if img.size != (tw, th):
-          img = img.resize((tw, th), resample=Image.LANCZOS)
+      fd, tmp_path = tempfile.mkstemp(prefix="icon_builder_layer_", suffix=".png")
+      os.close(fd)
+      temp_paths.append(tmp_path)
 
-        fd, tmp_path = tempfile.mkstemp(prefix="png_to_ico_layer_", suffix=".png")
-        os.close(fd)
-
-        img.save(tmp_path, format="PNG", optimize=True)
-        temp_paths.append(tmp_path)
-
+      render_source_to_png(full, tmp_path, (tw, th))
       ico.add_png(tmp_path)
       logging.info("Add layer %dx%d from %s", tw, th, full)
 
@@ -799,6 +998,50 @@ def build_ico_from_layers(
   return ico_path
 
 
+def pick_png_output_source(
+  input_dir: str,
+  layers: List[LayerItem],
+) -> Optional[str]:
+  """
+  Pick a source image for the generated PNG.
+
+  Prefer enabled layers, sorted largest first. Fall back to any existing layer source.
+  """
+  candidates = sort_layers_desc([it for it in layers if it.enabled]) or sort_layers_desc(layers)
+  for it in candidates:
+    full = resolve_path(input_dir, it.source_rel_path)
+    if os.path.isfile(full) and is_supported_source_path(full):
+      return full
+  return None
+
+
+def build_png_from_layers(
+  input_dir: str,
+  layers: List[LayerItem],
+  output_dir: str,
+  output_name: str,
+  output_size: int,
+) -> str:
+  """
+  Render a project PNG from the best available source image.
+  """
+  if not output_name.lower().endswith(".png"):
+    output_name += ".png"
+
+  out_dir_abs = resolve_output_dir(input_dir, output_dir)
+  os.makedirs(out_dir_abs, exist_ok=True)
+  png_path = os.path.abspath(os.path.join(out_dir_abs, output_name))
+
+  source = pick_png_output_source(input_dir, layers)
+  if not source:
+    raise ValueError("No source image exists on disk for PNG output. Fix paths or add layers.")
+
+  size = max(1, min(ICO_MAX_PNG_SIZE, int(output_size)))
+  render_source_to_png(source, png_path, (size, size))
+  logging.info("PNG written: %s", png_path)
+  return png_path
+
+
 # =============================================================================
 # UI
 # =============================================================================
@@ -808,11 +1051,11 @@ class App(ctk.CTk):
   CustomTkinter application for managing layers and building ICO files.
 
   UI features
-  - Select input directory (contains png-to-ico.json, may contain discovered layers).
+  - Select input directory (contains icon-builder.json, may contain discovered layers).
   - Rescan layers (auto-discovery from filenames containing WxH).
   - Per-layer controls:
     - Enable/disable
-    - Choose source PNG file (any)
+    - Choose source PNG or SVG file (any)
     - Set target size (W,H)
     - Remove layer
   - Output settings:
@@ -885,6 +1128,10 @@ class App(ctk.CTk):
 
     self.output_dir_var = tk.StringVar(value=os.path.abspath(os.getcwd()))
     self.output_name_var = tk.StringVar(value="icon.ico")
+    self.png_output_enabled_var = tk.BooleanVar(value=True)
+    self.png_output_dir_var = tk.StringVar(value=os.path.abspath(os.getcwd()))
+    self.png_output_name_var = tk.StringVar(value="icon.png")
+    self.png_output_size_var = tk.StringVar(value="256")
 
     self._build_top_controls()
     self._build_layers_editor()
@@ -928,7 +1175,7 @@ class App(ctk.CTk):
     )
     self.input_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
 
-    self.btn_browse_input = ctk.CTkButton(self.top, text="Browse…", command=self.on_browse_input_dir, width=110)
+    self.btn_browse_input = ctk.CTkButton(self.top, text="Browse...", command=self.on_browse_input_dir, width=110)
     self.btn_browse_input.grid(row=0, column=2, padx=8, pady=8)
 
     self.btn_load = ctk.CTkButton(self.top, text="Load/Refresh", command=self.on_load_input_dir, width=120)
@@ -991,10 +1238,10 @@ class App(ctk.CTk):
 
     ctk.CTkLabel(
       header,
-      text="Layers (largest → smallest) — each layer has a source PNG + a target size (W,H)",
+      text="Layers (largest to smallest) - each layer has a source image + a target size (W,H)",
     ).pack(side="left", padx=8)
 
-    self.btn_add_layer = ctk.CTkButton(header, text="Add Layer…", command=self.on_add_layer, width=120)
+    self.btn_add_layer = ctk.CTkButton(header, text="Add Layer...", command=self.on_add_layer, width=120)
     self.btn_add_layer.pack(side="right", padx=8)
 
     self.layer_scroll = ctk.CTkScrollableFrame(self.mid)
@@ -1009,19 +1256,42 @@ class App(ctk.CTk):
     ctk.CTkLabel(self.bottom, text="Output Directory:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
     self.out_dir_entry = ctk.CTkEntry(self.bottom, textvariable=self.output_dir_var)
     self.out_dir_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
-    ctk.CTkButton(self.bottom, text="Browse…", command=self.on_browse_output_dir, width=110).grid(row=0, column=2, padx=8, pady=8)
+    ctk.CTkButton(self.bottom, text="Browse...", command=self.on_browse_output_dir, width=110).grid(row=0, column=2, padx=8, pady=8)
 
     ctk.CTkLabel(self.bottom, text="ICO Name:").grid(row=1, column=0, sticky="w", padx=8, pady=8)
     self.out_name_entry = ctk.CTkEntry(self.bottom, textvariable=self.output_name_var)
     self.out_name_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=8)
 
-    self.btn_build = ctk.CTkButton(self.bottom, text="Build ICO", command=self.on_build_ico, width=140)
-    self.btn_build.grid(row=1, column=2, padx=8, pady=8)
+    self.png_output_check = ctk.CTkCheckBox(
+      self.bottom,
+      text="Build PNG",
+      variable=self.png_output_enabled_var,
+      command=self.persist_config_if_possible,
+    )
+    self.png_output_check.grid(row=2, column=0, sticky="w", padx=8, pady=8)
+
+    self.png_dir_entry = ctk.CTkEntry(self.bottom, textvariable=self.png_output_dir_var)
+    self.png_dir_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=8)
+    ctk.CTkButton(self.bottom, text="Browse...", command=self.on_browse_png_output_dir, width=110).grid(row=2, column=2, padx=8, pady=8)
+
+    ctk.CTkLabel(self.bottom, text="PNG Name:").grid(row=3, column=0, sticky="w", padx=8, pady=8)
+    self.png_name_entry = ctk.CTkEntry(self.bottom, textvariable=self.png_output_name_var)
+    self.png_name_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=8)
+
+    ctk.CTkLabel(self.bottom, text="PNG Size:").grid(row=4, column=0, sticky="w", padx=8, pady=8)
+    self.png_size_entry = ctk.CTkEntry(self.bottom, textvariable=self.png_output_size_var)
+    self.png_size_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=8)
+
+    self.btn_build = ctk.CTkButton(self.bottom, text="Build", command=self.on_build_ico, width=140)
+    self.btn_build.grid(row=4, column=2, padx=8, pady=8)
 
     self.bottom.grid_columnconfigure(1, weight=1)
 
     self.output_dir_var.trace_add("write", lambda *_: self.persist_config_if_possible())
     self.output_name_var.trace_add("write", lambda *_: self.persist_config_if_possible())
+    self.png_output_dir_var.trace_add("write", lambda *_: self.persist_config_if_possible())
+    self.png_output_name_var.trace_add("write", lambda *_: self.persist_config_if_possible())
+    self.png_output_size_var.trace_add("write", lambda *_: self.persist_config_if_possible())
 
   # ---------------------------------------------------------------------------
   # Config IO
@@ -1041,6 +1311,12 @@ class App(ctk.CTk):
 
       "output_dir": normalize_dirpath(self.input_dir, self.output_dir_var.get()),
       "output_name": self.output_name_var.get(),
+      "png_output": {
+        "enabled": bool(self.png_output_enabled_var.get()),
+        "output_dir": normalize_dirpath(self.input_dir, self.png_output_dir_var.get()),
+        "output_name": self.png_output_name_var.get(),
+        "size": parse_square_size_token(self.png_output_size_var.get(), fallback=256),
+      },
       "layers": layers_to_config(self.layers),
     }
 
@@ -1048,7 +1324,7 @@ class App(ctk.CTk):
     if not self.input_dir or not os.path.isdir(self.input_dir):
       return
 
-    # Hard guarantee: any config write keeps layers ordered largest→smallest.
+    # Hard guarantee: any config write keeps layers ordered largest to smallest.
     self.layers = sort_layers_desc(self.layers)
     save_config(self.input_dir, self.make_config_dict())
 
@@ -1059,6 +1335,7 @@ class App(ctk.CTk):
     cfg = load_config(self.input_dir)
 
     default_out_dir = "."
+    default_png_out_dir = "."
 
     # Resolve sizes for this project (project override > app default > hardcoded)
     standard_sizes = resolve_standard_target_sizes(cfg, self.app_cfg)
@@ -1074,9 +1351,14 @@ class App(ctk.CTk):
 
       cfg_layers = layers_from_config(cfg, max_size=max_size)
       merged = merge_config_layers_with_discovery(self.input_dir, cfg_layers, discovered)
+      if bool(cfg.get("_loaded_from_legacy_config")):
+        merged = repair_missing_layer_sources_from_available_sources(self.input_dir, merged)
 
       out_dir = cfg.get("output_dir")
       out_name = cfg.get("output_name")
+      png_output = cfg.get("png_output", {})
+      if not isinstance(png_output, dict):
+        png_output = {}
 
       # If project config contains an invalid output directory:
       # - alert the user
@@ -1100,6 +1382,30 @@ class App(ctk.CTk):
       if isinstance(out_name, str) and out_name.strip():
         self.output_name_var.set(out_name)
 
+      png_enabled = png_output.get("enabled")
+      if isinstance(png_enabled, bool):
+        self.png_output_enabled_var.set(png_enabled)
+      else:
+        self.png_output_enabled_var.set(bool(cfg.get("_loaded_from_legacy_config")))
+
+      png_out_dir = png_output.get("output_dir")
+      if isinstance(png_out_dir, str) and png_out_dir.strip():
+        png_out_dir_text = png_out_dir.strip()
+      elif bool(cfg.get("_loaded_from_legacy_config")):
+        png_out_dir_text = out_dir.strip() if isinstance(out_dir, str) and out_dir.strip() else default_out_dir
+      else:
+        png_out_dir_text = default_png_out_dir
+
+      png_out_dir_abs = resolve_output_dir(self.input_dir, png_out_dir_text)
+      if os.path.isdir(png_out_dir_abs):
+        self.png_output_dir_var.set(png_out_dir_text)
+      else:
+        self.png_output_dir_var.set(default_png_out_dir)
+
+      png_name = png_output.get("output_name")
+      self.png_output_name_var.set(png_name.strip() if isinstance(png_name, str) and png_name.strip() else "icon.png")
+      self.png_output_size_var.set(str(parse_square_size_token(str(png_output.get("size", "256")), fallback=256)))
+
       self.layers = sort_layers_desc(merged)
     else:
       # New project => no project override yet
@@ -1108,7 +1414,7 @@ class App(ctk.CTk):
       # NEW: Default layer rows + auto-pick best source for each target (uses resolved standard sizes).
       self.layers = build_default_layers_from_sources(self.input_dir, standard_sizes)
 
-      # Fallback: if no readable PNGs, keep old discovery behavior
+      # Fallback: if no readable image sources, keep size-token discovery behavior
       if not self.layers:
         init_layers: List[LayerItem] = []
         for size, relp in discovered.items():
@@ -1116,6 +1422,10 @@ class App(ctk.CTk):
         self.layers = sort_layers_desc(init_layers)
 
       self.output_dir_var.set(default_out_dir)
+      self.png_output_enabled_var.set(True)
+      self.png_output_dir_var.set(default_png_out_dir)
+      self.png_output_name_var.set("icon.png")
+      self.png_output_size_var.set("256")
 
     # Keep the Target Sizes entry synced:
     # - show project override if set, else show the resolved list (app default/hardcoded)
@@ -1169,7 +1479,7 @@ class App(ctk.CTk):
   def refresh_layer_rows(self) -> None:
     """
     Rebuild the scrollable layer list rows from self.layers.
-    Always sorts largest → smallest.
+    Always sorts largest to smallest.
     """
     self.layers = sort_layers_desc(self.layers)
     self.clear_layer_rows()
@@ -1211,7 +1521,7 @@ class App(ctk.CTk):
       ent_w.bind("<Return>", _make_on_size_commit(idx, w_var, h_var))
       ent_h.bind("<Return>", _make_on_size_commit(idx, w_var, h_var))
 
-      # Path + missing indicator (+ actual PNG dimensions after the name)
+      # Path + missing indicator (+ actual source dimensions after the name)
       full = resolve_path(self.input_dir, it.source_rel_path) if self.input_dir else it.source_rel_path
       missing = (self.input_dir and not os.path.isfile(full))
 
@@ -1219,7 +1529,7 @@ class App(ctk.CTk):
 
       # If the file exists, append its actual pixel dimensions after the filename.
       if not missing and full and os.path.isfile(full):
-        size = infer_png_size(full)
+        size = infer_source_size(full)
         if size:
           sw, sh = size
           path_text += f"  ({sw}x{sh})"
@@ -1240,7 +1550,7 @@ class App(ctk.CTk):
           self.on_remove_layer(i)
         return _on_remove
 
-      btn_pick = ctk.CTkButton(frame, text="File…", command=_make_on_pick_file(idx), width=90)
+      btn_pick = ctk.CTkButton(frame, text="File...", command=_make_on_pick_file(idx), width=90)
       btn_pick.grid(row=0, column=6, padx=6, pady=8)
 
       btn_remove = ctk.CTkButton(frame, text="Remove", command=_make_on_remove(idx), width=90)
@@ -1308,7 +1618,7 @@ class App(ctk.CTk):
 
   def on_set_project_target_sizes(self) -> None:
     """
-    Save Target Sizes as a per-project override (png-to-ico.json -> target_sizes).
+    Save Target Sizes as a per-project override (icon-builder.json -> target_sizes).
     """
     if not self.input_dir or not os.path.isdir(self.input_dir):
       messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
@@ -1360,7 +1670,7 @@ class App(ctk.CTk):
   def on_browse_input_dir(self) -> None:
     cur = str(self.input_dir_var.get() or "").strip()
     initialdir = cur if (cur and os.path.isdir(cur)) else (self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd()))
-    p = filedialog.askdirectory(title="Select input directory (contains png-to-ico.json)", initialdir=initialdir)
+    p = filedialog.askdirectory(title="Select input directory (contains icon-builder.json)", initialdir=initialdir)
     if not p:
       return
     self.input_dir_var.set(os.path.abspath(p))
@@ -1401,24 +1711,34 @@ class App(ctk.CTk):
       return
     self.output_dir_var.set(normalize_dirpath(self.input_dir, p) if self.input_dir else os.path.abspath(p))
 
+  def on_browse_png_output_dir(self) -> None:
+    cur = str(self.png_output_dir_var.get() or "").strip()
+    initialdir = resolve_output_dir(self.input_dir, cur) if (self.input_dir and cur) else cur
+    if not initialdir or not os.path.isdir(initialdir):
+      initialdir = self.input_dir if (self.input_dir and os.path.isdir(self.input_dir)) else os.path.abspath(os.getcwd())
+    p = filedialog.askdirectory(title="Select PNG output directory", initialdir=initialdir)
+    if not p:
+      return
+    self.png_output_dir_var.set(normalize_dirpath(self.input_dir, p) if self.input_dir else os.path.abspath(p))
+
   def on_add_layer(self) -> None:
     """
-    Add a new layer by selecting a PNG file.
+    Add a new layer by selecting a PNG or SVG file.
 
     New behavior:
-    - Any PNG is allowed (no filename token required).
+    - Any PNG or SVG is allowed (no filename token required).
     - Initial target size is chosen by:
       1) WxH token in filename, else
-      2) actual PNG dimensions.
+      2) actual source dimensions.
     """
     if not self.input_dir or not os.path.isdir(self.input_dir):
       messagebox.showerror(APP_TITLE, "Select a valid input directory first.")
       return
 
     p = filedialog.askopenfilename(
-      title="Select layer PNG (any PNG; target size is editable)",
+      title="Select layer image (PNG or SVG; target size is editable)",
       initialdir=self.input_dir,
-      filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
+      filetypes=SOURCE_FILETYPES,
     )
     if not p:
       return
@@ -1428,10 +1748,10 @@ class App(ctk.CTk):
 
     size = parse_size_token(os.path.basename(p_abs))
     if not size:
-      size = infer_png_size(p_abs)
+      size = infer_source_size(p_abs)
 
     if not size:
-      messagebox.showerror(APP_TITLE, "Could not read PNG dimensions. The file may be invalid.")
+      messagebox.showerror(APP_TITLE, "Could not read image dimensions. The file may be invalid.")
       return
 
     w0, h0 = size
@@ -1452,10 +1772,10 @@ class App(ctk.CTk):
 
   def on_replace_layer_file(self, idx: int) -> None:
     """
-    Pick/replace the source PNG for a layer.
+    Pick/replace the source image for a layer.
 
     Notes:
-    - Any PNG is allowed.
+    - Any PNG or SVG is allowed.
     - Target size is NOT changed automatically (you control it via the Target W/H fields).
     """
     if not self.input_dir or not os.path.isdir(self.input_dir):
@@ -1464,9 +1784,9 @@ class App(ctk.CTk):
 
     current = self.layers[idx]
     p = filedialog.askopenfilename(
-      title="Select source PNG for this layer",
+      title="Select source image for this layer",
       initialdir=self.input_dir,
-      filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
+      filetypes=SOURCE_FILETYPES,
     )
     if not p:
       return
@@ -1504,7 +1824,7 @@ class App(ctk.CTk):
       messagebox.showerror(APP_TITLE, "No layers are enabled.")
       return
 
-    # Sanity checks: paths exist + PNG decode + target sizes valid.
+    # Sanity checks: paths exist + source decode/parse + target sizes valid.
     bad: List[str] = []
     for it in enabled:
       tw, th = it.target_size
@@ -1517,11 +1837,9 @@ class App(ctk.CTk):
         bad.append(f"{it.source_rel_path} (missing)")
         continue
 
-      try:
-        with Image.open(full) as img:
-          img.verify()
-      except Exception:
-        bad.append(f"{it.source_rel_path} (invalid PNG)")
+      reason = validate_source_file(full)
+      if reason:
+        bad.append(f"{it.source_rel_path} ({reason})")
 
     if bad:
       messagebox.showerror(APP_TITLE, "Some enabled layers are invalid:\n\n" + "\n".join(bad))
@@ -1538,8 +1856,21 @@ class App(ctk.CTk):
         output_name=out_name,
       )
 
+      png_path = ""
+      if bool(self.png_output_enabled_var.get()):
+        png_path = build_png_from_layers(
+          input_dir=self.input_dir,
+          layers=self.layers,
+          output_dir=self.png_output_dir_var.get().strip() or out_dir,
+          output_name=self.png_output_name_var.get().strip() or "icon.png",
+          output_size=parse_square_size_token(self.png_output_size_var.get(), fallback=256),
+        )
+
       self.persist_config_if_possible()
-      messagebox.showinfo(APP_TITLE, f"ICO created:\n{ico_path}")
+      if png_path:
+        messagebox.showinfo(APP_TITLE, f"ICO created:\n{ico_path}\n\nPNG created:\n{png_path}")
+      else:
+        messagebox.showinfo(APP_TITLE, f"ICO created:\n{ico_path}")
     except Exception as e:
       logging.exception("Build failed: %s", e)
       messagebox.showerror(APP_TITLE, f"Build failed:\n{e}")

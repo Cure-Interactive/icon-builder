@@ -1,8 +1,9 @@
 # =============================================================================
 # requirements.txt
-# png_to_ico_gui.py dependencies
+# icon_builder.py dependencies
 # =============================================================================
 
 Pillow>=10.0.0
 icoutil>=1.0.2
 customtkinter>=5.2.2
+resvg-py>=0.2.6

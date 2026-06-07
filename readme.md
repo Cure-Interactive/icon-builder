@@ -1,6 +1,6 @@
-# PNG To ICO
+# Icon Builder
 
-Desktop utility for building Windows `.ico` files from one or more PNG layers.
+Desktop utility for building Windows `.ico` files from one or more PNG or SVG layers. It can also render a project PNG from the same source layers.
 
 ## Requirements
 
@@ -26,11 +26,11 @@ On Linux or macOS, activate the virtual environment with `source .venv/bin/activ
 ## Run
 
 ```bash
-python png-to-ico.py
+python icon-builder.py
 ```
 
 ## Input Convention
 
-The app can discover PNG layers whose filenames include a size token such as `256x256`, `64x64`, or `16x16`.
+The app can discover PNG and SVG layers whose filenames include a size token such as `256x256`, `64x64`, or `16x16`.
 
 See `wiki.md` for details.

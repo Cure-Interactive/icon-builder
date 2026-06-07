@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # =============================================================================
-# [🐍 Python Script] [📦 Installer] [🧰 Requirements Bootstrap]
+# [Python Script] [Installer] [Requirements Bootstrap]
 # =============================================================================
 """
-install.py — generic dependency installer for a folder that contains a requirements file.
+install.py - generic dependency installer for a folder that contains a requirements file.
 
 Purpose:
 - Run this script from ANY working directory.
@@ -75,7 +75,7 @@ def _run(cmd: t.List[str], *, cwd: str, print_only: bool) -> int:
   Run a subprocess command, streaming output.
   """
   pretty = " ".join(_shell_quote(x) for x in cmd)
-  _log("[🛠️ CMD]", f"{pretty} (cwd={cwd})")
+  _log("[CMD]", f"{pretty} (cwd={cwd})")
   if print_only:
     return 0
 
@@ -88,7 +88,7 @@ def _run(cmd: t.List[str], *, cwd: str, print_only: bool) -> int:
   )
   if p.stdout:
     for line in p.stdout.splitlines():
-      _log("[📜 OUT]", line)
+      _log("[OUT]", line)
   return p.returncode
 
 
@@ -134,7 +134,7 @@ def _create_venv(python_exe: str, venv_dir: str, *, cwd: str, print_only: bool) 
   if os.path.isdir(venv_dir):
     return
 
-  _log("[🧪 VENV]", f"Creating venv: {venv_dir}")
+  _log("[VENV]", f"Creating venv: {venv_dir}")
   rc = _run([python_exe, "-m", "venv", venv_dir], cwd=cwd, print_only=print_only)
   if rc != 0:
     raise RuntimeError(f"venv creation failed (exit={rc})")
@@ -153,7 +153,7 @@ def _pip_install(
   Upgrade pip tooling (optional) then install -r requirements.
   """
   if upgrade_pip:
-    _log("[📦 PIP]", "Upgrading pip/setuptools/wheel…")
+    _log("[PIP]", "Upgrading pip/setuptools/wheel...")
     rc = _run(
       [python_exe, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
       cwd=cwd,
@@ -162,7 +162,7 @@ def _pip_install(
     if rc != 0:
       raise RuntimeError(f"pip upgrade failed (exit={rc})")
 
-  _log("[📦 PIP]", f"Installing from: {requirements_path}")
+  _log("[PIP]", f"Installing from: {requirements_path}")
   cmd = [python_exe, "-m", "pip", "install", "-r", requirements_path]
   if extra_pip_args:
     cmd.extend(extra_pip_args)
@@ -237,8 +237,8 @@ def main(argv: t.List[str]) -> int:
   try:
     _ensure_file_exists(req_path)
   except FileNotFoundError:
-    _log("[❌ ERR]", f"Requirements file not found: {req_path}")
-    _log("[ℹ️ INFO]", "Put install.py next to requirements.txt, or use --req <file>.")
+    _log("[ERR]", f"Requirements file not found: {req_path}")
+    _log("[INFO]", "Put install.py next to requirements.txt, or use --req <file>.")
     return 2
 
   # Decide python executable to use (system vs venv).
@@ -249,7 +249,7 @@ def main(argv: t.List[str]) -> int:
 
     # Ensure venv module is available
     if shutil.which(python_exe) is None and not os.path.isfile(python_exe):
-      _log("[❌ ERR]", f"Python executable not found: {python_exe}")
+      _log("[ERR]", f"Python executable not found: {python_exe}")
       return 3
 
     try:
@@ -257,13 +257,13 @@ def main(argv: t.List[str]) -> int:
       venv_python, _venv_pip = _venv_paths(venv_dir_abs)
 
       if not args.print_only and not os.path.isfile(venv_python):
-        _log("[❌ ERR]", f"venv python not found after creation: {venv_python}")
+        _log("[ERR]", f"venv python not found after creation: {venv_python}")
         return 3
 
       python_exe = venv_python
-      _log("[🧪 VENV]", f"Using venv python: {python_exe}")
+      _log("[VENV]", f"Using venv python: {python_exe}")
     except Exception as e:
-      _log("[❌ ERR]", f"{e}")
+      _log("[ERR]", f"{e}")
       return 3
 
   try:
@@ -276,16 +276,16 @@ def main(argv: t.List[str]) -> int:
       print_only=args.print_only,
     )
   except Exception as e:
-    _log("[❌ ERR]", str(e))
+    _log("[ERR]", str(e))
     return 1
 
-  _log("[✅ OK]", "Dependencies installed.")
+  _log("[OK]", "Dependencies installed.")
   if args.venv:
-    _log("[ℹ️ INFO]", "To use the venv:")
+    _log("[INFO]", "To use the venv:")
     if os.name == "nt":
-      _log("[ℹ️ INFO]", f'  {os.path.join(args.venv_dir, "Scripts", "activate")}')
+      _log("[INFO]", f'  {os.path.join(args.venv_dir, "Scripts", "activate")}')
     else:
-      _log("[ℹ️ INFO]", f'  source {os.path.join(args.venv_dir, "bin", "activate")}')
+      _log("[INFO]", f'  source {os.path.join(args.venv_dir, "bin", "activate")}')
   return 0
 
 

@@ -1,46 +1,66 @@
-# PNG To ICO Wiki
+# Icon Builder Wiki
 
-PNG To ICO builds a Windows `.ico` file from PNG layers.
+Icon Builder builds a Windows `.ico` file from PNG and SVG layers. It can also render a PNG from the same source layers for apps that use a window or splash image.
 
-## Quick Start
+## Running
+
+```bash
+python icon-builder.py
+```
+
+## Installation
 
 ```bash
 python setup.py --venv
-python png-to-ico.py
 ```
 
-Manual install:
+Or install dependencies manually from `requirements.txt`, then run:
 
 ```bash
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python png-to-ico.py
+python icon-builder.py
 ```
 
-On Linux or macOS, use `source .venv/bin/activate`.
+## Layer Discovery
 
-## PNG Layer Discovery
-
-The app detects PNG files whose names include a size token:
+The app detects PNG and SVG files whose names include a size token:
 
 ```text
-icon_256x256.png
+icon_256x256.svg
 icon_128x128.png
-icon_32x32.png
+icon_32x32.svg
 icon_16x16.png
 ```
 
 Layers are ordered largest to smallest in the generated `.ico`.
 
-## Project State
+## Configuration
 
-The app can save layer configuration into `config.json` inside the selected input directory. App-level recent-folder settings are stored in `config.json` beside `png-to-ico.py`. Runtime config is ignored by Git.
+The app saves layer configuration into `icon-builder.json` inside the selected input directory. If a legacy `png-to-ico.json` exists and `icon-builder.json` does not, the app loads the legacy config and then saves the current config as `icon-builder.json`.
 
-## Common Workflow
+PNG output is configured in the `png_output` object:
 
-1. Start `png-to-ico.py`.
-2. Select the input directory containing PNG layers.
-3. Review discovered layers.
-4. Add, remove, disable, or reorder layers if needed.
-5. Build the `.ico` file.
+```json
+{
+  "png_output": {
+    "enabled": true,
+    "output_dir": "..",
+    "output_name": "icon.png",
+    "size": 256
+  }
+}
+```
+
+App-level recent-folder settings are stored in `config.json` beside `icon-builder.py`. Runtime config is ignored by Git.
+
+## Workflow
+
+1. Start `icon-builder.py`.
+2. Select the input directory containing PNG or SVG layers.
+3. Review detected layers.
+4. Add or replace layer files as needed.
+5. Adjust target sizes if needed.
+6. Build the `.ico` file and optional `.png` file.
+
+## SVG Notes
+
+SVG sources are rasterized with `resvg-py` at each layer's target size before being added to the `.ico`. SVG files that rely on unavailable system fonts may render differently across operating systems; for the most consistent icon output, convert text to paths before building.
